@@ -3,3 +3,4 @@ requests
 curl_cffi
 PSNAWP
 Flask
+playwright
