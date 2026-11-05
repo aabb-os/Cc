@@ -1,1 +1,5 @@
-
+pyTelegramBotAPI
+requests
+curl_cffi
+PSNAWP
+Flask
