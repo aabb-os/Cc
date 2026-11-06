@@ -4,8 +4,9 @@ import threading
 import time
 import random
 import string
-import collections
+import json
 from flask import Flask
+from curl_cffi import requests as curl_requests
 from psnawp_api import PSNAWP
 from psnawp_api.core.psnawp_exceptions import PSNAWPNotFoundError, PSNAWPForbiddenError
 
@@ -14,7 +15,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "PSN V8 Ultimate is running!"
+    return "PSN Accurate Bot is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8000))
@@ -32,138 +33,136 @@ if not TOKEN or not OWNER_IDS_STR or not NPSSO_TOKEN:
 OWNER_IDS = [int(i.strip()) for i in OWNER_IDS_STR.split(",")]
 bot = telebot.TeleBot(TOKEN)
 
-# --- تهيئة PSNAWP ---
-psnawp = None
-init_error = None
-try:
-    psnawp = PSNAWP(NPSSO_TOKEN)
-    me = psnawp.me() # تسجيل الدخول وجلب التوكن تلقائياً
-    print(f"✅ PSNAWP Logged in as: {me.online_id}")
-except Exception as e:
-    init_error = str(e)
-    print(f"❌ PSNAWP initialization error: {init_error}")
+# --- متغيرات المصادقة ---
+access_token = None
+token_lock = threading.Lock()
+
+def get_access_token():
+    global access_token
+    url = "https://ca.account.sony.com/api/authz/v3/oauth/token"
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Authorization": "Basic MDk1MTUxNTktNzIzNy00MzcwLTliNDAtMzgwNmU2N2MwODkxOnVjUGprYTV0bnRCMktxc1A=",
+    }
+    data = {
+        "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+        "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
+        "subject_token": NPSSO_TOKEN,
+        "subject_token_type": "urn:ietf:params:oauth:token-type:npsso",
+        "scope": "psn:mobile.v2.core psn:clientapp",
+    }
+    try:
+        res = curl_requests.post(url, headers=headers, data=data, impersonate="safari15_5", timeout=10)
+        if res.status_code == 200:
+            with token_lock:
+                access_token = res.json().get("access_token")
+            print("✅ Access Token generated.")
+            return True
+        else:
+            print(f"❌ Token Error: {res.status_code} - {res.text}")
+    except Exception as e:
+        print(f"❌ Token Exception: {e}")
+    return False
+
+# جلب التوكن أول مرة
+get_access_token()
 
 stop_psn = threading.Event()
-stats = {
-    "total_checked": 0, 
-    "total_found": 0,
-    "private_count": 0,
-    "error_count": 0
-}
+stats = {"checked": 0, "found": 0, "errors": 0}
 stats_lock = threading.Lock()
 
 def is_owner(m): return m.from_user.id in OWNER_IDS
 
-# ==========================================
-# دالة التوليد (5 خانات)
-# ==========================================
 def gen_psn():
     chars = string.ascii_lowercase + string.digits
     while True:
         u = random.choice(string.ascii_lowercase) + "".join(random.choice(chars) for _ in range(4))
         yield u
 
-# ==========================================
-# محرك الفحص القاطع (Double Check)
-# ==========================================
-def check_psn_decisive(username):
-    if not psnawp:
-        return "NO_AUTH"
+def check_psn_accurate(username):
+    global access_token
+    with token_lock:
+        token = access_token
+    
+    if not token:
+        get_access_token()
+        with token_lock:
+            token = access_token
+        if not token: return "NO_AUTH"
+
+    url = f"https://accounts.api.playstation.com/api/v1/accounts/checkOnlineId?onlineId={username}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "Origin": "https://www.playstation.com",
+        "Referer": "https://www.playstation.com/",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X)"
+    }
+    
+    try:
+        res = curl_requests.get(url, headers=headers, impersonate="safari15_5", timeout=10)
         
-    # الفحص الأول
-    try:
-        psnawp.user(online_id=username)
-        return False # محجوز
-    except PSNAWPForbiddenError:
-        with stats_lock: stats["private_count"] += 1
-        return False # حساب خاص = محجوز
-    except PSNAWPNotFoundError:
-        pass # ربما متاح، نكمل
-    except Exception as e:
-        with stats_lock: stats["error_count"] += 1
-        return None
+        if res.status_code == 200:
+            if res.json().get("available") is True:
+                return True
+            return False
+        elif res.status_code in [401, 403]:
+            # التوكن انتهى أو مرفوض
+            get_access_token()
+            return "TOKEN_EXPIRED"
+        elif res.status_code == 429:
+            return "RATE_LIMIT"
+    except Exception:
+        return "ERROR"
+    return False
 
-    time.sleep(2.0) # تأخير للتأكيد (عشان سوني ما تكذب)
-
-    # الفحص الثاني (القاطع)
-    try:
-        psnawp.user(online_id=username)
-        return False # محجوز (سوني كذبت في المرة الأولى)
-    except PSNAWPForbiddenError:
-        with stats_lock: stats["private_count"] += 1
-        return False
-    except PSNAWPNotFoundError:
-        return True # متاح 100% (عدى الفحصين بنجاح)
-    except Exception as e:
-        with stats_lock: stats["error_count"] += 1
-        return None
-
-# ==========================================
-# دالة التشغيل
-# ==========================================
-def human_worker(chat_id):
+def worker(chat_id):
     global stats
     while not stop_psn.is_set():
         try:
             u = next(gen_psn())
+            with stats_lock: stats["checked"] += 1
             
-            with stats_lock:
-                stats["total_checked"] += 1
-                current_checked = stats["total_checked"]
-            
-            res = check_psn_decisive(u)
+            res = check_psn_accurate(u)
             
             if res is True:
                 utype = "خماسي مكرر" if len(set(u)) < 5 else "خماسي"
-                with stats_lock:
-                    stats["total_found"] += 1
-                    
-                msg = (f"استلم يالامير {u} 🎮🔥\n"
-                       f"( سوني - {utype} - قاطع 100% )")
-                bot.send_message(chat_id, msg)
+                with stats_lock: stats["found"] += 1
+                bot.send_message(chat_id, f"استلم يالامير {u} 🎮🔥\n( سوني - {utype} - قاطع 100% )")
+            elif res == "RATE_LIMIT":
+                time.sleep(15) # انتظار عند الحظر
+            elif res == "TOKEN_EXPIRED":
+                time.sleep(5)
+            elif res == "ERROR":
+                with stats_lock: stats["errors"] += 1
                 
-            # تحديث الحالة كل 100 فحص
-            if current_checked % 100 == 0:
-                bot.send_message(chat_id, f"🔄 جاري الفحص... (فحص {current_checked})")
-                
-            # سرعة آمنة جداً (تأخير بين 1.5 و 2.5 ثانية)
-            time.sleep(random.uniform(1.5, 2.5))
+            # السرعة الآمنة جداً لمنع الحظر (4 ثواني بين كل فحص)
+            time.sleep(4)
             
-        except Exception as e:
+        except Exception:
             time.sleep(2)
 
-def start_psn_snipers(chat_id):
-    if not psnawp:
-        bot.send_message(chat_id, f"❌ فشل الاتصال بسوني.\nالسبب: `{init_error}`")
+def start_sniper(chat_id):
+    if not access_token:
+        bot.send_message(chat_id, "❌ فشل جلب التوكن. تأكد من NPSSO في المتغيرات.")
         return
-        
-    # خيط واحد فقط لضمان عدم الحظر (Zero Ban)
-    threading.Thread(target=human_worker, args=(chat_id,), daemon=True).start()
+    threading.Thread(target=worker, args=(chat_id,), daemon=True).start()
 
-# ==========================================
-# أوامر البوت
-# ==========================================
 @bot.message_handler(commands=['start'])
 def cmd_start(m):
     if not is_owner(m): return
-    bot.reply_to(m, "☢️ PSN V8 Ultimate Bot\n\n"
-                     "/psn - تشغيل الصيد\n"
-                     "/stop_all - إيقاف\n"
-                     "/monitor - مراقبة النظام\n"
-                     "/test - اختبار دقة الفحص")
+    bot.reply_to(m, "☢️ بوت سوني (القاطع الرسمي)\n\n/psn - تشغيل الصيد\n/stop_all - إيقاف\n/status - الإحصائيات")
 
 @bot.message_handler(commands=['psn'])
 def cmd_psn(m):
     if not is_owner(m): return
     stop_psn.clear()
     with stats_lock:
-        stats["total_checked"] = 0
-        stats["total_found"] = 0
-        stats["private_count"] = 0
-        stats["error_count"] = 0
-        
-    bot.reply_to(m, "🚀 جاري تشغيل الصيد (خيط واحد - دقة 100%)...")
-    start_psn_snipers(m.chat.id)
+        stats["checked"] = 0
+        stats["found"] = 0
+        stats["errors"] = 0
+    bot.reply_to(m, "🚀 جاري التشغيل (سرعة آمنة جداً)...")
+    start_sniper(m.chat.id)
 
 @bot.message_handler(commands=['stop_all'])
 def cmd_stop_all(m):
@@ -171,78 +170,24 @@ def cmd_stop_all(m):
     stop_psn.set()
     bot.reply_to(m, "⏹ تم إيقاف الكل.")
 
-@bot.message_handler(commands=['monitor'])
-def cmd_monitor(m):
+@bot.message_handler(commands=['status'])
+def cmd_status(m):
     if not is_owner(m): return
-    is_running = not stop_psn.is_set()
-    sys_status = "🟢 يعمل" if is_running else "🔴 متوقف"
-    
     with stats_lock:
-        msg = (f"🖥️ **لوحة المراقبة**\n\n"
-               f"⚙️ **الحالة:** {sys_status}\n\n"
-               f"🔍 **إجمالي الفحص:** {stats['total_checked']}\n"
-               f"✅ **المتاح:** {stats['total_found']}\n"
-               f"🔒 **حسابات خاصة:** {stats['private_count']}\n"
-               f"⚠️ **أخطاء:** {stats['error_count']}")
+        msg = (f"📊 **الإحصائيات:**\n"
+               f"🔍 الفحص: {stats['checked']}\n"
+               f"✅ المتاح: {stats['found']}\n"
+               f"⚠️ أخطاء: {stats['errors']}")
     bot.reply_to(m, msg, parse_mode='Markdown')
 
-@bot.message_handler(commands=['test'])
-def cmd_test(m):
-    if not is_owner(m): return
-    if not psnawp:
-        bot.reply_to(m, f"❌ المكتبة فشلت في الاتصال:\n`{init_error}`")
-        return
-        
-    bot.reply_to(m, "🧪 جاري فحص دقة المكتبة... (انتظر 3 ثواني)")
-    
-    # فحص يوزر محجوز معروف
-    try:
-        psnawp.user(online_id="tiktok")
-        taken_res = "محجوز (صحيح) ✅"
-    except PSNAWPForbiddenError:
-        taken_res = "محجوز/خاص (صحيح) ✅"
-    except PSNAWPNotFoundError:
-        taken_res = "متاح (خطأ!) ❌"
-    except Exception:
-        taken_res = "خطأ في الشبكة ⚠️"
-        
-    time.sleep(2)
-    
-    # فحص يوزر عشوائي طويل
-    rand_user = "a8s7d6f5g4h3j2k"
-    try:
-        psnawp.user(online_id=rand_user)
-        rand_res = "محجوز (خطأ!) ❌"
-    except PSNAWPForbiddenError:
-        rand_res = "محجوز/خاص (خطأ!) ❌"
-    except PSNAWPNotFoundError:
-        rand_res = "متاح (صحيح) ✅"
-    except Exception:
-        rand_res = "خطأ في الشبكة ⚠️"
-        
-    msg = (f"📊 **نتيجة الاختبار:**\n\n"
-           f"▪️ يوزر `tiktok`: {taken_res}\n"
-           f"▪️ يوزر `{rand_user}`: {rand_res}\n\n"
-           f"*(إذا طلعت الإجابتين ✅، يعني البوت دقيق 100%)*")
-    bot.reply_to(m, msg, parse_mode='Markdown')
-
-# ==========================================
-# التشغيل النهائي (Anti-409 + Stability)
-# ==========================================
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
-    print("PSN V8 Ultimate Bot is running...")
+    print("Sony Accurate Bot is running...")
+    try: bot.delete_webhook(drop_pending_updates=True)
+    except: pass
     
-    # تنظيف الويب هوك لمنع التعارض
-    try:
-        bot.delete_webhook(drop_pending_updates=True)
-    except Exception as e:
-        print(f"Webhook cleanup error: {e}")
-        
-    # حلقة لا نهائية لضمان عدم توقف البوت عند أي خطأ
     while True:
         try:
             bot.polling(non_stop=True, interval=0, timeout=60)
         except Exception as e:
-            print(f"Polling error: {e}. Restarting in 5s...")
             time.sleep(5)
