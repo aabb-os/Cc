@@ -4,7 +4,7 @@ import threading
 import time
 import random
 import string
-import json
+import collections
 from flask import Flask
 from psnawp_api import PSNAWP
 from psnawp_api.core.psnawp_exceptions import PSNAWPNotFoundError, PSNAWPForbiddenError
@@ -15,7 +15,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Sony Ultimate Bot is running!"
+    return "Sony Decisive Bot is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8000))
@@ -43,13 +43,17 @@ except Exception as e:
     print(f"❌ PSNAWP initialization error: {e}")
 
 stop_psn = threading.Event()
-stats = {"total_found": 0, "total_checked": 0}
+stats = {
+    "total_found": 0, 
+    "total_checked": 0,
+    "codes": collections.Counter()
+}
 stats_lock = threading.Lock()
 
 def is_owner(m): return m.from_user.id in OWNER_IDS
 
 # ==========================================
-# دالة التوليد (5 خانات)
+# دالة التوليد
 # ==========================================
 def gen_psn():
     chars = string.ascii_lowercase + string.digits
@@ -58,50 +62,60 @@ def gen_psn():
         yield u
 
 # ==========================================
-# محرك الفحص مع الفحص القاطع (Decisive Check)
+# الفحص القاطع (نقطة نهاية تغيير الاسم الرسمية)
 # ==========================================
-def check_psn_ultimate(username):
+def check_psn_decisive(username):
     if not psnawp:
         return "NO_AUTH"
         
-    # الفحص الأول: PSNAWP
+    # 1. الفحص الأولي عبر PSNAWP (لتصفية المحجوزين بسرعة)
     try:
         psnawp.user(online_id=username)
-        return False # محجوز
+        with stats_lock: stats["codes"]["200 (محجوز)"] += 1
+        return False
     except PSNAWPForbiddenError:
-        return False # حساب خاص = محجوز
+        with stats_lock: stats["codes"]["403 (خاص/محجوز)"] += 1
+        return False 
     except PSNAWPNotFoundError:
+        with stats_lock: stats["codes"]["404 (غير موجود)"] += 1
         pass # ربما متاح، نكمل للفحص القاطع
     except Exception as e:
-        if "429" in str(e) or "RateLimit" in str(e):
-            return "BLOCKED"
+        with stats_lock: stats["codes"]["Error (شبكة)"] += 1
         return None
 
-    # الفحص القاطع: رابط تغيير الاسم الرسمي في سوني
+    time.sleep(1.0) # تأخير بسيط
+
+    # 2. الفحص القاطع: نقطة نهاية تغيير الاسم
     try:
-        # سحب التوكن الحالي من المكتبة
         token = psnawp.authenticator._access_token
         headers = {
             "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
             "Accept": "application/json",
             "Origin": "https://www.playstation.com",
             "Referer": "https://www.playstation.com/"
         }
-        url = f"https://accounts.api.playstation.com/api/v1/accounts/checkOnlineId?onlineId={username}"
+        url = "https://accounts.api.playstation.com/api/v1/accounts/onlineIds"
+        payload = {"onlineId": username, "reserveIfAvailable": True}
         
-        res = curl_requests.get(url, headers=headers, impersonate="safari15_5", timeout=10)
+        res = curl_requests.post(url, headers=headers, json=payload, impersonate="safari15_5", timeout=10)
         
         if res.status_code == 200:
             data = res.json()
+            # إذا رجع "available": true فهذا يعني أن الاسم متاح 100%
             if data.get("available") is True:
-                return True # متاح 100% (حكم سوني النهائي)
+                with stats_lock: stats["codes"]["200 (متاح قاطع)"] += 1
+                return True
             return False # محجوز
         elif res.status_code in [401, 403, 429]:
+            with stats_lock: stats["codes"][f"{res.status_code} (حظر)"] += 1
             return "BLOCKED"
-    except Exception:
+            
+    except Exception as e:
+        with stats_lock: stats["codes"]["Error (قاطع)"] += 1
         pass
         
-    return None # إذا فشل الفحص القاطع، لا نرسله
+    return None
 
 # ==========================================
 # دالة التشغيل
@@ -116,7 +130,7 @@ def human_worker(chat_id):
                 stats["total_checked"] += 1
                 current_checked = stats["total_checked"]
             
-            res = check_psn_ultimate(u)
+            res = check_psn_decisive(u)
             
             if res is True:
                 if len(set(u)) < 5:
@@ -128,7 +142,7 @@ def human_worker(chat_id):
                     stats["total_found"] += 1
                     
                 msg = (f"استلم يالامير {u} 🎮🔥\n"
-                       f"( سوني - {utype} )")
+                       f"( سوني - {utype} - قاطع 100% )")
                        
                 bot.send_message(chat_id, msg)
                 
@@ -150,7 +164,6 @@ def start_psn_snipers(chat_id):
         bot.send_message(chat_id, "❌ فشل الاتصال بسوني. تأكد من NPSSO_TOKEN.")
         return
         
-    # 3 خيوط (نفس السرعة اللي عجبتك)
     for i in range(3): 
         threading.Thread(target=human_worker, args=(chat_id,), daemon=True).start()
         time.sleep(0.2)
@@ -161,7 +174,7 @@ def start_psn_snipers(chat_id):
 @bot.message_handler(commands=['start'])
 def cmd_start(m):
     if not is_owner(m): return
-    bot.reply_to(m, "☢️ بوت صيد يوزرات PSN (الفحص القاطع)\n\n/psn - تشغيل الصيد\n/stop_all - إيقاف\n/status - الإحصائيات")
+    bot.reply_to(m, "☢️ بوت صيد يوزرات PSN (الفحص القاطع)\n\n/psn - تشغيل الصيد\n/stop_all - إيقاف\n/status - الإحصائيات\n/sony_status - ردود سوني")
 
 @bot.message_handler(commands=['psn'])
 def cmd_psn(m):
@@ -181,8 +194,20 @@ def cmd_status(m):
     if not is_owner(m): return
     with stats_lock:
         msg = (f"📊 **إحصائيات سوني:**\n\n"
-               f"✅ **المتاح:** {stats['total_found']}\n"
+               f"✅ **المتاح (قاطع):** {stats['total_found']}\n"
                f"🔍 **إجمالي الفحص:** {stats['total_checked']}")
+    bot.reply_to(m, msg, parse_mode='Markdown')
+
+@bot.message_handler(commands=['sony_status'])
+def cmd_sony_status(m):
+    if not is_owner(m): return
+    with stats_lock:
+        msg = "📡 **ردود سوني (منذ التشغيل):**\n\n"
+        if not stats["codes"]:
+            msg += "لا توجد ردود بعد. شغل `/psn` أولاً."
+        else:
+            for code, count in stats["codes"].most_common():
+                msg += f"▪️ **{code}**: {count} مرة\n"
     bot.reply_to(m, msg, parse_mode='Markdown')
 
 # ==========================================
@@ -190,7 +215,7 @@ def cmd_status(m):
 # ==========================================
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
-    print("Sony Ultimate Bot is running...")
+    print("Sony Decisive Bot is running...")
     try: bot.delete_webhook(drop_pending_updates=True)
     except: pass
     bot.infinity_polling()
