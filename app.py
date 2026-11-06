@@ -4,8 +4,6 @@ import threading
 import time
 import random
 import string
-import requests
-import concurrent.futures
 from curl_cffi import requests as curl_requests
 from flask import Flask
 
@@ -14,7 +12,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Sony Speed Bot is running!"
+    return "Sony Human-Mode Bot is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8000))
@@ -31,101 +29,31 @@ if not TOKEN or not OWNER_IDS_STR:
 OWNER_IDS = [int(i.strip()) for i in OWNER_IDS_STR.split(",")]
 bot = telebot.TeleBot(TOKEN)
 
-# --- نظام البروكسيات السريع ---
-PROXY_SOURCES = [
-    "https://raw.githubusercontent.com/komutan234/Proxy-List-Free/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
-    "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
-    "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
-    "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
-    "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/protocols/http/data.txt",
-    "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt"
+# --- البروكسيات العشرة (من Webshare) ---
+PROXIES = [
+    "http://jbtndvvo:o2mmxk3x9sm7@45.38.107.97:6014",
+    "http://jbtndvvo:o2mmxk3x9sm7@64.137.96.74:6641",
+    "http://jbtndvvo:o2mmxk3x9sm7@198.23.243.226:6361",
+    "http://jbtndvvo:o2mmxk3x9sm7@38.154.185.97:6370",
+    "http://jbtndvvo:o2mmxk3x9sm7@84.247.60.125:6095",
+    "http://jbtndvvo:o2mmxk3x9sm7@191.96.254.138:6185",
+    "http://jbtndvvo:o2mmxk3x9sm7@198.46.161.42:5092",
+    "http://jbtndvvo:o2mmxk3x9sm7@64.137.10.153:5803",
+    "http://jbtndvvo:o2mmxk3x9sm7@104.164.49.38:7693",
+    "http://jbtndvvo:o2mmxk3x9sm7@23.26.71.145:5628"
 ]
 
-working_proxies = []
-proxy_blacklist = {} 
-proxy_lock = threading.Lock()
-proxy_cycle_index = 0
-proxy_stats = {"fetched": 0, "working": 0, "blacklisted": 0}
-
-def check_single_proxy(proxy):
-    """دالة لفحص بروكسي واحد (تستخدم في الخيوط المتوازية)"""
-    proxy_url = f"http://{proxy}"
-    try:
-        # فحص سريع جداً (2.5 ثانية)
-        res = curl_requests.get("https://api.ipify.org?format=json", proxy=proxy_url, timeout=2.5)
-        if res.status_code == 200:
-            return proxy_url
-    except Exception:
-        pass
-    return None
-
-def proxy_background_worker():
-    global proxy_stats, working_proxies, proxy_blacklist
-    while True:
-        now = time.time()
-        with proxy_lock:
-            # إزالة البروكسيات من القائمة السوداء بعد 5 دقائق
-            expired = [p for p, t in proxy_blacklist.items() if now > t]
-            for p in expired: del proxy_blacklist[p]
-        
-        # جلب بروكسيات جديدة إذا قل العدد عن 20
-        if len(working_proxies) < 20:
-            raw_proxies = set()
-            for url in PROXY_SOURCES:
-                try:
-                    r = requests.get(url, timeout=10)
-                    if r.status_code == 200:
-                        for line in r.text.splitlines():
-                            line = line.strip()
-                            if line and ":" in line: raw_proxies.add(line)
-                except Exception: pass
-            
-            with proxy_lock:
-                proxy_stats["fetched"] = len(raw_proxies)
-            
-            # نفحص عينة كبيرة (200 بروكسي) بتوازي 50 خيط
-            sample = random.sample(list(raw_proxies), min(200, len(raw_proxies)))
-            
-            with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
-                results = executor.map(check_single_proxy, sample)
-                for res in results:
-                    if res:
-                        with proxy_lock:
-                            if res not in working_proxies and res not in proxy_blacklist:
-                                working_proxies.append(res)
-                                proxy_stats["working"] = len(working_proxies)
-                                if len(working_proxies) >= 25: # نكتفي بـ 25 شغال
-                                    break
-        
-        time.sleep(5) # تحديث سريع
-
-threading.Thread(target=proxy_background_worker, daemon=True).start()
-
-def get_next_proxy():
-    global proxy_cycle_index
-    with proxy_lock:
-        if not working_proxies: return None
-        for _ in range(len(working_proxies)):
-            proxy = working_proxies[proxy_cycle_index % len(working_proxies)]
-            proxy_cycle_index += 1
-            if proxy not in proxy_blacklist:
-                return proxy
-    return None
-
-def blacklist_proxy(proxy):
-    with proxy_lock:
-        if proxy:
-            proxy_blacklist[proxy] = time.time() + 300
-            if proxy in working_proxies: working_proxies.remove(proxy)
-            proxy_stats["blacklisted"] = len(proxy_blacklist)
-            proxy_stats["working"] = len(working_proxies)
+# تتبع حالة البروكسيات
+proxy_health = {i: "⏳ لم يفحص بعد" for i in range(len(PROXIES))}
 
 stop_psn = threading.Event()
-stats = {"psn_checked": 0, "psn_found": 0}
+stats = {"psn_checked": 0, "psn_found": 0, "current_proxy_idx": 0}
 
 def is_owner(m): return m.from_user.id in OWNER_IDS
 
+# ==========================================
+# دالة التوليد (5 خانات عشوائية تبدأ بحرف)
+# ==========================================
 def gen_psn():
     chars = string.ascii_lowercase + string.digits
     while True:
@@ -133,65 +61,71 @@ def gen_psn():
         yield u
 
 # ==========================================
-# محرك فحص سوني (عبر PSNProfiles + تدوير IP)
+# محرك الفحص (عبر PSNProfiles + التصرف البشري)
 # ==========================================
-def check_psn_fast(username):
-    proxy = get_next_proxy()
-    if not proxy: 
-        return "NO_PROXY" # ما فيه بروكسي شغال حالياً
-    
-    proxies = {"http": proxy, "https": proxy}
+def check_psn_human(username, proxy_url, proxy_idx):
+    global proxy_health
+    proxies = {"http": proxy_url, "https": proxy_url}
     
     try:
         url = f"https://psnprofiles.com/{username}"
-        # انتحال بصمة متصفح حقيقي
-        res = curl_requests.get(url, proxies=proxies, impersonate="chrome124", timeout=8)
+        # انتحال بصمة كروم 124 عشان نتخطى الحماية
+        res = curl_requests.get(url, proxies=proxies, impersonate="chrome124", timeout=15)
         
         if res.status_code == 404:
+            proxy_health[proxy_idx] = "✅ شغال (رد 404)"
             return True # متاح 100%
         elif res.status_code == 200:
+            proxy_health[proxy_idx] = "✅ شغال (رد 200)"
             return False # محجوز
         elif res.status_code in [403, 429, 503]:
-            blacklist_proxy(proxy)
+            proxy_health[proxy_idx] = "🚫 محظور من الموقع"
             return "BLOCKED"
+        else:
+            proxy_health[proxy_idx] = f"⚠️ كود {res.status_code}"
+            return False
             
-    except Exception:
-        blacklist_proxy(proxy)
+    except Exception as e:
+        proxy_health[proxy_idx] = "❌ خطأ اتصال (ميت)"
         return "ERROR"
-        
-    return False
 
 # ==========================================
-# دوال التشغيل
+# دالة التشغيل (خيط واحد فقط للتصرف البشري)
 # ==========================================
-def worker_psn(chat_id, thread_id):
+def human_worker(chat_id):
+    global stats
+    proxy_index = 0
+    total_proxies = len(PROXIES)
+
     while not stop_psn.is_set():
         try:
-            if proxy_stats["working"] == 0:
-                time.sleep(2) # انتظر إذا ما فيه بروكسيات
-                continue
-                
+            # اختيار البروكسي بالترتيب (Round-Robin)
+            current_proxy = PROXIES[proxy_index]
+            stats["current_proxy_idx"] = proxy_index + 1
+            
             u = next(gen_psn())
             stats["psn_checked"] += 1
             
-            res = check_psn_fast(u)
+            # الفحص
+            res = check_psn_human(u, current_proxy, proxy_index)
             
             if res is True:
                 stats["psn_found"] += 1
                 bot.send_message(chat_id, f"استلم يالامير {u} 🎮🥷🏼\n( سوني - 5 خانات متاح 100% )")
-            elif res in ["BLOCKED", "ERROR", "NO_PROXY"]:
-                time.sleep(0.5) 
-                continue
                 
-            time.sleep(0.5) # سرعة عالية
+            # الانتقال للبروكسي التالي
+            proxy_index = (proxy_index + 1) % total_proxies
+            
+            # الفارق الزمني البشري العشوائي (من 6 إلى 12 ثانية)
+            delay = random.uniform(6.0, 12.0)
+            time.sleep(delay)
             
         except Exception as e:
-            time.sleep(1)
+            time.sleep(5)
 
 def start_psn_snipers(chat_id):
-    for i in range(10): 
-        threading.Thread(target=worker_psn, args=(chat_id, i+1), daemon=True).start()
-        time.sleep(0.1)
+    # خيط واحد فقط لضمان عدم الحظر
+    threading.Thread(target=human_worker, args=(chat_id,), daemon=True).start()
 
 # ==========================================
 # أوامر البوت
@@ -199,13 +133,17 @@ def start_psn_snipers(chat_id):
 @bot.message_handler(commands=['start'])
 def cmd_start(m):
     if not is_owner(m): return
-    bot.reply_to(m, "☢️ بوت سوني (سرعة الضوء + بروكسيات محسنة)\n\n/psn - تشغيل الصيد\n/stop_all - إيقاف\n/status - الإحصائيات")
+    bot.reply_to(m, "☢️ بوت سوني (الوضع البشري - Zero Ban)\n\n"
+                     "/psn - تشغيل الصيد\n"
+                     "/stop_all - إيقاف\n"
+                     "/status - الإحصائيات\n"
+                     "/proxy_status - حالة البروكسيات")
 
 @bot.message_handler(commands=['psn'])
 def cmd_psn(m):
     if not is_owner(m): return
     stop_psn.clear()
-    bot.reply_to(m, "🚀 جاري تشغيل 10 خيوط بأقصى سرعة...")
+    bot.reply_to(m, "🚀 جاري تشغيل الوضع البشري (10 بروكسيات بالتناوب + تأخير عشوائي)...")
     start_psn_snipers(m.chat.id)
 
 @bot.message_handler(commands=['stop_all'])
@@ -217,12 +155,24 @@ def cmd_stop_all(m):
 @bot.message_handler(commands=['status'])
 def cmd_status(m):
     if not is_owner(m): return
-    msg = (f"📊 **إحصائيات سوني (سرعة الضوء):**\n\n"
+    msg = (f"📊 **إحصائيات (الوضع البشري):**\n\n"
            f"✅ **المتاح:** {stats['psn_found']}\n"
            f"🔍 **إجمالي الفحص:** {stats['psn_checked']}\n\n"
-           f"📥 **تم سحب (Fetched):** {proxy_stats['fetched']} بروكسي\n"
-           f"🔗 **الشغالة حالياً:** {proxy_stats['working']}\n"
-           f"🚫 **المحظورة:** {proxy_stats['blacklisted']}")
+           f"🌐 **البروكسي الحالي:** {stats['current_proxy_idx']} من 10\n"
+           f"⏱️ **الحالة:** يفحص ببطء وتأخير عشوائي (آمن 100%)")
+    bot.reply_to(m, msg, parse_mode='Markdown')
+
+@bot.message_handler(commands=['proxy_status'])
+def cmd_proxy_status(m):
+    if not is_owner(m): return
+    msg = "🌐 **حالة البروكسيات العشرة:**\n\n"
+    
+    for i in range(len(PROXIES)):
+        # نستخرج الـ IP والـ Port بس عشان ما نطول الرسالة
+        ip_port = PROXIES[i].split('@')[-1]
+        status = proxy_health[i]
+        msg += f"▪️ **بروكسي {i+1}** (`{ip_port}`):\n   {status}\n\n"
+        
     bot.reply_to(m, msg, parse_mode='Markdown')
 
 # ==========================================
@@ -230,7 +180,7 @@ def cmd_status(m):
 # ==========================================
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
-    print("Sony Speed Bot is running...")
+    print("Sony Human-Mode Bot is running...")
     try: bot.delete_webhook(drop_pending_updates=True)
     except: pass
     bot.infinity_polling()
