@@ -5,6 +5,7 @@ import time
 import random
 import string
 import queue
+import json
 from flask import Flask
 from psnawp_api import PSNAWP
 from psnawp_api.core.psnawp_exceptions import PSNAWPNotFoundError, PSNAWPForbiddenError
@@ -33,33 +34,50 @@ if not TOKEN or not OWNER_IDS_STR or not NPSSO_TOKEN:
 OWNER_IDS = [int(i.strip()) for i in OWNER_IDS_STR.split(",")]
 bot = telebot.TeleBot(TOKEN)
 
-# --- تهيئة PSNAWP ---
+# --- تهيئة PSNAWP وجلب التوكن ---
 psnawp = None
-try:
-    psnawp = PSNAWP(NPSSO_TOKEN)
-    psnawp.me()
-    print("✅ PSNAWP initialized successfully.")
-except Exception as e:
-    print(f"❌ PSNAWP initialization error: {e}")
+access_token = None
+token_lock = threading.Lock()
+
+def init_sony():
+    global psnawp, access_token
+    try:
+        psnawp = PSNAWP(NPSSO_TOKEN)
+        psnawp.me()
+        print("✅ PSNAWP initialized.")
+        
+        # جلب التوكن بالقوة عشان المدقق
+        url = "https://ca.account.sony.com/api/authz/v3/oauth/token"
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Authorization": "Basic MDk1MTUxNTktNzIzNy00MzcwLTliNDAtMzgwNmU2N2MwODkxOnVjUGprYTV0bnRCMktxc1A=",
+        }
+        data = {
+            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
+            "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
+            "subject_token": NPSSO_TOKEN,
+            "subject_token_type": "urn:ietf:params:oauth:token-type:npsso",
+            "scope": "psn:mobile.v2.core psn:clientapp",
+        }
+        res = curl_requests.post(url, headers=headers, data=data, impersonate="safari15_5", timeout=10)
+        if res.status_code == 200:
+            with token_lock:
+                access_token = res.json().get("access_token")
+            print("✅ Token extracted manually.")
+            return True
+    except Exception as e:
+        print(f"❌ Init Error: {e}")
+    return False
+
+init_sony()
 
 stop_psn = threading.Event()
-
-# إحصائيات النظام
-stats = {
-    "hunter_checked": 0, 
-    "verifier_found": 0,
-    "queue_dropped": 0
-}
+stats = {"hunter_checked": 0, "verifier_found": 0, "queue_dropped": 0}
 stats_lock = threading.Lock()
-
-# الطابور
-suspect_queue = queue.Queue(maxsize=200)
+suspect_queue = queue.Queue(maxsize=500)
 
 def is_owner(m): return m.from_user.id in OWNER_IDS
 
-# ==========================================
-# دالة التوليد
-# ==========================================
 def gen_psn():
     chars = string.ascii_lowercase + string.digits
     while True:
@@ -67,7 +85,7 @@ def gen_psn():
         yield u
 
 # ==========================================
-# 1. الصياد (سريع - 10 خيوط)
+# 1. الصياد (سريع)
 # ==========================================
 def hunter_worker():
     global stats
@@ -77,6 +95,10 @@ def hunter_worker():
             with stats_lock:
                 stats["hunter_checked"] += 1
                 
+            if not psnawp:
+                time.sleep(1)
+                continue
+
             try:
                 psnawp.user(online_id=u)
             except PSNAWPForbiddenError:
@@ -91,12 +113,11 @@ def hunter_worker():
                 pass
                 
             time.sleep(0.1)
-            
         except Exception:
             time.sleep(1)
 
 # ==========================================
-# 2. المدقق (دقيق - خيطين)
+# 2. المدقق (دقيق)
 # ==========================================
 def verifier_worker(chat_id):
     global stats
@@ -107,9 +128,13 @@ def verifier_worker(chat_id):
             continue
 
         try:
-            token = getattr(psnawp.authenticator, '_access_token', None)
+            with token_lock:
+                token = access_token
+                
             if not token:
-                time.sleep(5)
+                # إذا اختفى التوكن، نجدد
+                init_sony()
+                time.sleep(2)
                 continue
                 
             headers = {
@@ -123,35 +148,27 @@ def verifier_worker(chat_id):
             if res.status_code == 200:
                 data = res.json()
                 if data.get("available") is True:
-                    if len(set(u)) < 5:
-                        utype = "خماسي مكرر"
-                    else:
-                        utype = "خماسي"
-                        
+                    utype = "خماسي مكرر" if len(set(u)) < 5 else "خماسي"
                     with stats_lock:
                         stats["verifier_found"] += 1
-                        
-                    msg = (f"استلم يالامير {u} 🎮🔥\n"
-                           f"( سوني - {utype} - قاطع 100% )")
+                    msg = f"استلم يالامير {u} 🎮🔥\n( سوني - {utype} - قاطع 100% )"
                     bot.send_message(chat_id, msg)
-                    
-            elif res.status_code in [401, 403, 429]:
+            elif res.status_code in [401, 403]:
+                init_sony() # توكن منتهي
                 time.sleep(5)
                 
             time.sleep(1)
             suspect_queue.task_done()
-            
         except Exception:
             time.sleep(1)
 
 def start_psn_snipers(chat_id):
-    if not psnawp:
-        bot.send_message(chat_id, "❌ فشل الاتصال بسوني. تأكد من NPSSO_TOKEN.")
+    if not psnawp or not access_token:
+        bot.send_message(chat_id, "❌ فشل الاتصال بسوني. التوكن غير متوفر. تأكد من NPSSO_TOKEN في المتغيرات.")
         return
         
     for i in range(10): 
         threading.Thread(target=hunter_worker, daemon=True).start()
-        
     for i in range(2):
         threading.Thread(target=verifier_worker, args=(chat_id,), daemon=True).start()
 
@@ -161,25 +178,22 @@ def start_psn_snipers(chat_id):
 @bot.message_handler(commands=['start'])
 def cmd_start(m):
     if not is_owner(m): return
-    bot.reply_to(m, "☢️ بوت صيد يوزرات PSN (الصياد والمدقق)\n\n"
-                     "/psn - تشغيل الصيد\n"
-                     "/stop_all - إيقاف\n"
-                     "/monitor - مراقبة النظام التفصيلية")
+    bot.reply_to(m, "☢️ بوت صيد يوزرات PSN\n\n/psn - تشغيل الصيد\n/stop_all - إيقاف\n/monitor - مراقبة النظام")
 
 @bot.message_handler(commands=['psn'])
 def cmd_psn(m):
     if not is_owner(m): return
     stop_psn.clear()
-    # تصفير الإحصائيات عند التشغيل الجديد
     with stats_lock:
         stats["hunter_checked"] = 0
         stats["verifier_found"] = 0
         stats["queue_dropped"] = 0
+    
     while not suspect_queue.empty():
         try: suspect_queue.get_nowait()
         except: break
         
-    bot.reply_to(m, "🚀 جاري تشغيل الصياد (10 خيوط) + المدقق (خيطين)...")
+    bot.reply_to(m, "🚀 جاري تشغيل الصياد (10) + المدقق (2)...")
     start_psn_snipers(m.chat.id)
 
 @bot.message_handler(commands=['stop_all'])
@@ -188,17 +202,15 @@ def cmd_stop_all(m):
     stop_psn.set()
     bot.reply_to(m, "⏹ تم إيقاف الكل.")
 
-# 👇 أمر المراقبة الشاملة الجديد 👇
 @bot.message_handler(commands=['monitor'])
 def cmd_monitor(m):
     if not is_owner(m): return
-    
     is_running = not stop_psn.is_set()
     sys_status = "🟢 يعمل" if is_running else "🔴 متوقف"
     
-    # التحقق من التوكن
-    token = getattr(psnawp.authenticator, '_access_token', None) if psnawp else None
-    token_status = "✅ شغال" if token else "❌ غير متوفر"
+    with token_lock:
+        has_token = access_token is not None
+    token_status = "✅ شغال" if has_token else "❌ غير متوفر"
     
     with stats_lock:
         h_checked = stats["hunter_checked"]
@@ -210,18 +222,14 @@ def cmd_monitor(m):
            f"⚙️ **حالة البوت:** {sys_status}\n"
            f"🔑 **التوكن:** {token_status}\n\n"
            f"🏃‍♂️ **الصيادين (10 خيوط):**\n"
-           f"▪️ إجمالي ما فحصوه: {h_checked} يوزر\n\n"
+           f"▪️ إجمالي الفحص: {h_checked} يوزر\n\n"
            f"📥 **طابور التدقيق:**\n"
            f"▪️ في الانتظار: {q_size} يوزر\n"
-           f"▪️ تم تخطيه (الطابور ممتلئ): {q_dropped} يوزر\n\n"
+           f"▪️ تم تخطيه (ممتلئ): {q_dropped} يوزر\n\n"
            f"🕵️‍♂️ **المدققين (خيطين):**\n"
-           f"▪️ إجمالي ما صادوه: {v_found} يوزر")
-           
+           f"▪️ إجمالي الصيد: {v_found} يوزر")
     bot.reply_to(m, msg, parse_mode='Markdown')
 
-# ==========================================
-# التشغيل النهائي
-# ==========================================
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
     print("Sony Producer-Consumer Bot is running...")
