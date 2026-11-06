@@ -1,4 +1,5 @@
 # app.py
+# Python 3.11
 import os
 import signal
 import random
@@ -144,7 +145,6 @@ def is_taken_by_psnawp(username: str) -> bool:
         return True
     except Exception as e:
         err_name = type(e).__name__
-        # التعرف على الخطأ بناءً على اسمه لتجنب مشاكل الإصدارات
         if "Forbidden" in err_name or "Unauthorized" in err_name:
             return True
         if "NotFound" in err_name:
@@ -224,12 +224,18 @@ def _bot_runner():
         bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
         log.warning("delete_webhook failed: %s", e)
+        
     while not shutdown_event.is_set():
         try:
-            bot.polling(non_stop=True, interval=0, timeout=60, allowed_updates=["message"])
+            # نستخدم infinity_polling لضمان استمرار العمل وعدم الانهيار
+            bot.infinity_polling(timeout=60, long_polling_timeout=30)
         except Exception as e:
-            log.error("polling crashed: %s", e)
-            time.sleep(5)
+            if "409" in str(e) or "Conflict" in str(e):
+                log.warning("409 Conflict detected (deploy overlap). Waiting 10s to retry...")
+                time.sleep(10)
+            else:
+                log.error("polling crashed: %s", e)
+                time.sleep(5)
 
 def _ensure_bot_thread():
     if not _bot_started.is_set():
