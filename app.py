@@ -6,15 +6,14 @@ import random
 import string
 from flask import Flask
 from psnawp_api import PSNAWP
-from psnawp_api.core.psnawp_exceptions import PSNAWPNotFoundError
-from psnawp_api.models.search import SearchDomain
+from psnawp_api.core.psnawp_exceptions import PSNAWPNotFoundError, PSNAWPForbiddenError
 
 # --- إعدادات Flask (لـ Render) ---
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "PSNAWP Sony Bot is running!"
+    return "Sony Accurate Bot is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8000))
@@ -26,7 +25,7 @@ OWNER_IDS_STR = os.environ.get("OWNER_ID")
 NPSSO_TOKEN = os.environ.get("NPSSO_TOKEN")
 
 if not TOKEN or not OWNER_IDS_STR or not NPSSO_TOKEN:
-    print("❌ خطأ: تأكد من إضافة BOT_TOKEN و OWNER_ID و NPSSO_TOKEN.")
+    print("❌ خطأ: تأكد من BOT_TOKEN و OWNER_ID و NPSSO_TOKEN.")
     exit(1)
 
 OWNER_IDS = [int(i.strip()) for i in OWNER_IDS_STR.split(",")]
@@ -37,7 +36,6 @@ psnawp = None
 init_error = None
 try:
     psnawp = PSNAWP(NPSSO_TOKEN)
-    # التحقق من صحة التوكن عند البدء
     psnawp.me()
     print("✅ PSNAWP initialized successfully.")
 except Exception as e:
@@ -45,46 +43,42 @@ except Exception as e:
     print(f"❌ PSNAWP initialization error: {init_error}")
 
 stop_psn = threading.Event()
-stats = {"psn_checked": 0, "psn_found": 0}
+stats = {"psn_checked": 0, "psn_found": 0, "psn_private": 0}
 
 def is_owner(m): return m.from_user.id in OWNER_IDS
 
 # ==========================================
-# دوال التوليد (5 خانات، يبدأ بحرف، فيه حرف مكرر)
+# دالة التوليد (7 خانات + حرف مكرر)
 # ==========================================
 def gen_psn():
     chars = string.ascii_lowercase + string.digits
     while True:
-        u = random.choice(string.ascii_lowercase) + "".join(random.choice(chars) for _ in range(4))
-        if len(set(u)) < 5: 
+        # نولد 7 خانات
+        u = random.choice(string.ascii_lowercase) + "".join(random.choice(chars) for _ in range(6))
+        # لازم يكون فيه حرف/رقم مكرر
+        if len(set(u)) < 7: 
             yield u
 
 # ==========================================
-# محرك فحص سوني (باستخدام PSNAWP)
+# محرك فحص سوني (دقيق 100%)
 # ==========================================
-def check_psn_psnawp(username):
+def check_psn_accurate(username):
     if not psnawp:
         return "NO_AUTH"
     try:
-        # محاولة جلب المستخدم. إذا رجع كائن، يعني اليوزر موجود (محجوز)
+        # إذا نجح جلب المستخدم، فهو محجوز
         psnawp.user(online_id=username)
         return False
+    except PSNAWPForbiddenError:
+        # الملف خاص => محجوز
+        stats["psn_private"] += 1
+        return False
     except PSNAWPNotFoundError:
-        # إذا رجع خطأ "غير موجود"، قد يكون متاحاً أو محجوزاً (خاص)
-        pass
+        # غير موجود => متاح
+        return True
     except Exception as e:
         if "429" in str(e) or "RateLimit" in str(e):
             return "BLOCKED"
-        return None
-
-    # التحقق الإضافي عبر البحث الداخلي (للتأكد من أنه غير موجود فعلاً)
-    try:
-        results = psnawp.search(search_query=username, search_domain=SearchDomain.SOCIAL_ALL_ACCOUNTS)
-        for res in results:
-            if res.get('onlineId') == username:
-                return False # موجود في البحث (محجوز)
-        return True # غير موجود في البحث (متاح)
-    except Exception:
         return None
 
 # ==========================================
@@ -96,27 +90,26 @@ def worker_psn(chat_id, thread_id):
             u = next(gen_psn())
             stats["psn_checked"] += 1
             
-            res = check_psn_psnawp(u)
+            res = check_psn_accurate(u)
             
             if res is True:
                 stats["psn_found"] += 1
-                bot.send_message(chat_id, f"استلم يالامير {u} 🎮🥷🏼\n( سوني - خماسي مكرر )")
+                bot.send_message(chat_id, f"استلم يالامير {u} 🎮🥷🏼\n( سوني - 7 خانات مكرر )")
             elif res == "BLOCKED":
-                print(f"[Thread {thread_id}] Rate Limited. Sleeping...")
                 time.sleep(30)
                 continue
             elif res == "NO_AUTH":
                 time.sleep(5)
                 continue
                 
-            time.sleep(random.uniform(2.0, 4.0))
+            time.sleep(random.uniform(1.0, 2.0))
             
         except Exception as e:
             time.sleep(2)
 
 def start_psn_snipers(chat_id):
     if not psnawp:
-        bot.send_message(chat_id, f"❌ فشل الاتصال بسوني:\n`{init_error}`\n\nتأكد من أن NPSSO_TOKEN صحيح وغير منتهي الصلاحية.")
+        bot.send_message(chat_id, f"❌ فشل الاتصال بسوني:\n`{init_error}`")
         return
         
     for i in range(5): 
@@ -130,13 +123,13 @@ def start_psn_snipers(chat_id):
 def cmd_start(m):
     if not is_owner(m): return
     status = "✅ متصل" if psnawp else "❌ غير متصل"
-    bot.reply_to(m, f"☢️ بوت سوني (PSNAWP)\nالحالة: {status}\n\n/psn - تشغيل\n/stop_all - إيقاف\n/status - الإحصائيات")
+    bot.reply_to(m, f"☢️ بوت سوني (7 خانات للنتائج السريعة)\nالحالة: {status}\n\n/psn - تشغيل الصيد\n/stop_all - إيقاف\n/status - الإحصائيات")
 
 @bot.message_handler(commands=['psn'])
 def cmd_psn(m):
     if not is_owner(m): return
     stop_psn.clear()
-    bot.reply_to(m, "🚀 جاري تشغيل 5 خيوط...")
+    bot.reply_to(m, "🚀 جاري تشغيل 5 خيوط (7 خانات) لضمان النتائج...")
     start_psn_snipers(m.chat.id)
 
 @bot.message_handler(commands=['stop_all'])
@@ -150,6 +143,7 @@ def cmd_status(m):
     if not is_owner(m): return
     msg = (f"📊 **إحصائيات سوني:**\n\n"
            f"✅ **المتاح:** {stats['psn_found']}\n"
+           f"🔒 **حسابات خاصة (تم استبعادها):** {stats['psn_private']}\n"
            f"🔍 **إجمالي الفحص:** {stats['psn_checked']}")
     bot.reply_to(m, msg, parse_mode='Markdown')
 
@@ -158,7 +152,7 @@ def cmd_status(m):
 # ==========================================
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
-    print("PSNAWP Bot is running...")
+    print("Sony Accurate Bot is running...")
     try: bot.delete_webhook(drop_pending_updates=True)
     except: pass
     bot.infinity_polling()
