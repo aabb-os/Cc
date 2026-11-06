@@ -4,16 +4,17 @@ import threading
 import time
 import random
 import string
-import json
-from curl_cffi import requests as curl_requests
 from flask import Flask
+from psnawp_api import PSNAWP
+from psnawp_api.core.psnawp_exceptions import PSNAWPNotFoundError
+from psnawp_api.models.search import SearchDomain
 
 # --- إعدادات Flask (لـ Render) ---
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Sony Real Auth Bot is running!"
+    return "PSNAWP Sony Bot is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8000))
@@ -25,78 +26,32 @@ OWNER_IDS_STR = os.environ.get("OWNER_ID")
 NPSSO_TOKEN = os.environ.get("NPSSO_TOKEN")
 
 if not TOKEN or not OWNER_IDS_STR or not NPSSO_TOKEN:
-    print("❌ خطأ: تأكد من BOT_TOKEN و OWNER_ID و NPSSO_TOKEN.")
+    print("❌ خطأ: تأكد من إضافة BOT_TOKEN و OWNER_ID و NPSSO_TOKEN.")
     exit(1)
 
 OWNER_IDS = [int(i.strip()) for i in OWNER_IDS_STR.split(",")]
 bot = telebot.TeleBot(TOKEN)
 
-# --- متغيرات المصادقة ---
-psn_session = curl_requests.Session(impersonate="safari15_5")
-access_token = None
-token_lock = threading.Lock()
-
-# القيمة الصحيحة والرسمية للـ Client
-CLIENT_BASIC_AUTH = "Basic MDk1MTUxNTktNzIzNy00MzcwLTliNDAtMzgwNmU2N2MwODkxOnVjUGprYTV0bnRCMktxc1A="
-
-def get_access_token(chat_id=None):
-    """تحويل NPSSO إلى Access Token بالطريقة الجديدة"""
-    global access_token
-    url = "https://ca.account.sony.com/api/authz/v3/oauth/token"
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Authorization": CLIENT_BASIC_AUTH,
-    }
-    
-    # الطريقة الجديدة (authorization_code بدل token-exchange)
-    data = {
-        "grant_type": "authorization_code",
-        "code": NPSSO_TOKEN,
-        "redirect_uri": "com.scee.psxandroid.scecompcall://redirect",
-        "token_format": "jwt",
-    }
-    
-    try:
-        res = psn_session.post(url, headers=headers, data=data, timeout=10)
-        if res.status_code == 200:
-            token = res.json().get("access_token")
-            if token:
-                with token_lock:
-                    access_token = token
-                print("✅ Access Token generated successfully.")
-                if chat_id:
-                    bot.send_message(chat_id, "✅ تم استخراج توكن سوني بنجاح! البوت جاهز للفحص.")
-                return True
-        
-        error_msg = f"❌ فشل استخراج التوكن.\nكود: {res.status_code}\nالرد: {res.text[:150]}"
-        print(error_msg)
-        if chat_id:
-            bot.send_message(chat_id, error_msg)
-        return False
-        
-    except Exception as e:
-        error_msg = f"❌ خطأ في الاتصال بسوني: {e}"
-        print(error_msg)
-        if chat_id:
-            bot.send_message(chat_id, error_msg)
-        return False
-
-def refresh_token_loop():
-    while True:
-        get_access_token()
-        time.sleep(1800)
-
-threading.Thread(target=refresh_token_loop, daemon=True).start()
+# --- تهيئة PSNAWP ---
+psnawp = None
+init_error = None
+try:
+    psnawp = PSNAWP(NPSSO_TOKEN)
+    # التحقق من صحة التوكن عند البدء
+    psnawp.me()
+    print("✅ PSNAWP initialized successfully.")
+except Exception as e:
+    init_error = str(e)
+    print(f"❌ PSNAWP initialization error: {init_error}")
 
 stop_psn = threading.Event()
-
-stats = {
-    "psn_checked": 0, "psn_found": 0,
-    "code_200": 0, "code_400": 0, "code_404": 0, "code_429": 0, "code_401": 0
-}
+stats = {"psn_checked": 0, "psn_found": 0}
 
 def is_owner(m): return m.from_user.id in OWNER_IDS
 
+# ==========================================
+# دوال التوليد (5 خانات، يبدأ بحرف، فيه حرف مكرر)
+# ==========================================
 def gen_psn():
     chars = string.ascii_lowercase + string.digits
     while True:
@@ -104,88 +59,84 @@ def gen_psn():
         if len(set(u)) < 5: 
             yield u
 
-def check_psn_api(username):
-    with token_lock:
-        token = access_token
-    
-    if not token:
-        return "NO_TOKEN"
-
-    ts = int(time.time() * 1000)
-    url = f"https://accounts.api.playstation.com/api/v1/accounts/checkOnlineId?onlineId={username}&_={ts}"
-    headers = {
-        "Accept": "application/json",
-        "Authorization": f"Bearer {token}",
-        "Origin": "https://www.playstation.com",
-        "Referer": "https://www.playstation.com/",
-    }
-    
+# ==========================================
+# محرك فحص سوني (باستخدام PSNAWP)
+# ==========================================
+def check_psn_psnawp(username):
+    if not psnawp:
+        return "NO_AUTH"
     try:
-        res = psn_session.get(url, headers=headers, timeout=10)
-        
-        if res.status_code == 200: stats["code_200"] += 1
-        elif res.status_code == 400: stats["code_400"] += 1
-        elif res.status_code == 404: stats["code_404"] += 1
-        elif res.status_code == 429: stats["code_429"] += 1
-        elif res.status_code == 401: stats["code_401"] += 1
-        
-        if res.status_code == 200:
-            data = res.json()
-            if data.get("available") is True:
-                return True
-            return False
-        elif res.status_code == 401:
-            return "UNAUTHORIZED"
-        elif res.status_code == 429:
-            return "BLOCKED"
-            
+        # محاولة جلب المستخدم. إذا رجع كائن، يعني اليوزر موجود (محجوز)
+        psnawp.user(online_id=username)
+        return False
+    except PSNAWPNotFoundError:
+        # إذا رجع خطأ "غير موجود"، قد يكون متاحاً أو محجوزاً (خاص)
+        pass
     except Exception as e:
-        print(f"Err: {e}")
-    return False
+        if "429" in str(e) or "RateLimit" in str(e):
+            return "BLOCKED"
+        return None
 
+    # التحقق الإضافي عبر البحث الداخلي (للتأكد من أنه غير موجود فعلاً)
+    try:
+        results = psnawp.search(search_query=username, search_domain=SearchDomain.SOCIAL_ALL_ACCOUNTS)
+        for res in results:
+            if res.get('onlineId') == username:
+                return False # موجود في البحث (محجوز)
+        return True # غير موجود في البحث (متاح)
+    except Exception:
+        return None
+
+# ==========================================
+# دوال التشغيل
+# ==========================================
 def worker_psn(chat_id, thread_id):
     while not stop_psn.is_set():
         try:
             u = next(gen_psn())
             stats["psn_checked"] += 1
             
-            res = check_psn_api(u)
+            res = check_psn_psnawp(u)
             
             if res is True:
                 stats["psn_found"] += 1
                 bot.send_message(chat_id, f"استلم يالامير {u} 🎮🥷🏼\n( سوني - خماسي مكرر )")
-            elif res == "UNAUTHORIZED":
-                print(f"[Thread {thread_id}] Token expired. Refreshing...")
-                get_access_token()
-                time.sleep(5)
-                continue
             elif res == "BLOCKED":
+                print(f"[Thread {thread_id}] Rate Limited. Sleeping...")
                 time.sleep(30)
                 continue
+            elif res == "NO_AUTH":
+                time.sleep(5)
+                continue
                 
-            time.sleep(random.uniform(0.5, 1.5))
+            time.sleep(random.uniform(2.0, 4.0))
             
         except Exception as e:
             time.sleep(2)
 
 def start_psn_snipers(chat_id):
-    if not get_access_token(chat_id):
+    if not psnawp:
+        bot.send_message(chat_id, f"❌ فشل الاتصال بسوني:\n`{init_error}`\n\nتأكد من أن NPSSO_TOKEN صحيح وغير منتهي الصلاحية.")
         return
         
-    for i in range(10): 
+    for i in range(5): 
         threading.Thread(target=worker_psn, args=(chat_id, i+1), daemon=True).start()
-        time.sleep(0.1)
+        time.sleep(0.2)
 
+# ==========================================
+# أوامر البوت
+# ==========================================
 @bot.message_handler(commands=['start'])
 def cmd_start(m):
     if not is_owner(m): return
-    bot.reply_to(m, "☢️ بوت سوني (Real Auth)\n\n/psn - تشغيل\n/stop_all - إيقاف\n/status - الإحصائيات")
+    status = "✅ متصل" if psnawp else "❌ غير متصل"
+    bot.reply_to(m, f"☢️ بوت سوني (PSNAWP)\nالحالة: {status}\n\n/psn - تشغيل\n/stop_all - إيقاف\n/status - الإحصائيات")
 
 @bot.message_handler(commands=['psn'])
 def cmd_psn(m):
     if not is_owner(m): return
     stop_psn.clear()
-    bot.reply_to(m, "🚀 جاري تسجيل الدخول وتشغيل 10 خيوط...")
+    bot.reply_to(m, "🚀 جاري تشغيل 5 خيوط...")
     start_psn_snipers(m.chat.id)
 
 @bot.message_handler(commands=['stop_all'])
@@ -199,17 +150,15 @@ def cmd_status(m):
     if not is_owner(m): return
     msg = (f"📊 **إحصائيات سوني:**\n\n"
            f"✅ **المتاح:** {stats['psn_found']}\n"
-           f"🔍 **إجمالي الفحص:** {stats['psn_checked']}\n\n"
-           f"📡 **أكواد الردود:**\n"
-           f"كود 200 (نجاح): {stats['code_200']}\n"
-           f"كود 404 (متاح): {stats['code_404']}\n"
-           f"كود 401 (مرفوض): {stats['code_401']}\n"
-           f"كود 429 (حظر): {stats['code_429']}")
+           f"🔍 **إجمالي الفحص:** {stats['psn_checked']}")
     bot.reply_to(m, msg, parse_mode='Markdown')
 
+# ==========================================
+# التشغيل النهائي
+# ==========================================
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
-    print("Sony Real Auth Bot is running...")
+    print("PSNAWP Bot is running...")
     try: bot.delete_webhook(drop_pending_updates=True)
     except: pass
     bot.infinity_polling()
