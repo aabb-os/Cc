@@ -20,20 +20,15 @@ def run_flask():
     app.run(host='0.0.0.0', port=port)
 
 # --- الإعدادات الأساسية ---
-TOKEN = os.environ.get("BOT_TOKEN")
-OWNER_ID = int(os.environ.get("OWNER_ID", 0))
-
-if not TOKEN or OWNER_ID == 0:
-    print("❌ خطأ: تأكد من المتغيرات.")
-    exit(1)
+TOKEN = "9134237983:AAFdXB9Zw2sXWujnAdebF8YuiU9cUx3XHYA"
+OWNER_IDS = [7972911357, 8487652113]
 
 bot = telebot.TeleBot(TOKEN)
-
 stop_psn = threading.Event()
 
-stats = {"psn_checked": 0, "psn_found": 0}
+stats = {"psn_checked": 0, "psn_found": 0, "psn_errors": 0}
 
-def is_owner(m): return m.from_user.id == OWNER_ID
+def is_owner(m): return m.from_user.id in OWNER_IDS
 
 # ==========================================
 # دوال التوليد
@@ -48,21 +43,13 @@ def gen_psn():
 # محرك الفحص (Playwright)
 # ==========================================
 def check_psn_playwright(username):
-    """يفتح متصفح مخفي، يدخل على PSNProfiles، ويشوف إذا اليوزر موجود"""
     try:
         with sync_playwright() as p:
             # تشغيل المتصفح بأقل استهلاك للرام
             browser = p.chromium.launch(
                 headless=True, 
-                args=[
-                    '--no-sandbox', 
-                    '--disable-dev-shm-usage', 
-                    '--disable-gpu',
-                    '--single-process', # مهم جداً لتقليل الرام
-                    '--disable-extensions'
-                ]
+                args=['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--single-process']
             )
-            # انتحال بصمة آيفون
             context = browser.new_context(
                 user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1"
             )
@@ -70,13 +57,12 @@ def check_psn_playwright(username):
             
             # فتح صفحة البروفايل في PSNProfiles
             url = f"https://psnprofiles.com/{username}"
-            response = page.goto(url, timeout=15000, wait_until="domcontentloaded")
+            response = page.goto(url, timeout=20000, wait_until="domcontentloaded")
             
             if response.status == 404:
                 browser.close()
                 return True # متاح
             
-            # التحقق من وجود رسالة "لم يتم العثور عليه"
             content = page.content()
             if "Profile Not Found" in content or "This user has not been found" in content:
                 browser.close()
@@ -86,8 +72,8 @@ def check_psn_playwright(username):
             return False # محجوز
             
     except Exception as e:
-        print(f"Playwright Error: {e}")
-        return None
+        # إذا صار خطأ في المتصفح (نفاذ رام أو حظر)، نرجع رسالة الخطأ
+        return f"ERROR: {str(e)[:50]}" 
 
 # ==========================================
 # دوال التشغيل
@@ -104,9 +90,14 @@ def worker_psn(chat_id):
             if res is True:
                 stats["psn_found"] += 1
                 bot.send_message(chat_id, f"استلم يالامير {u} 🎮🥷🏼\n( سوني - خماسي مكرر )")
+            elif isinstance(res, str) and res.startswith("ERROR"):
+                stats["psn_errors"] += 1
+                # يرسل الخطأ أول 3 مرات عشان نعرف وش المشكلة
+                if stats["psn_errors"] <= 3:
+                    bot.send_message(chat_id, f"🚨 خطأ في المتصفح:\n`{res}`", parse_mode='Markdown')
             
             count += 1
-            if count % 5 == 0: # المتصفح بطيء، نطمنه كل 5 فحوصات
+            if count % 10 == 0:
                 bot.send_message(chat_id, f"🔄 سوني (متصفح) يفحص... (فحص {stats['psn_checked']})")
                 
             time.sleep(random.uniform(3.0, 6.0))
@@ -119,14 +110,14 @@ def worker_psn(chat_id):
 @bot.message_handler(commands=['start'])
 def cmd_start(m):
     if not is_owner(m): return
-    bot.reply_to(m, "☢️ بوت المتصفح الوهمي\n\n/start_all - تشغيل سوني\n/psn - تشغيل سوني\n/stop_all - إيقاف\n/status - الإحصائيات")
+    bot.reply_to(m, "☢️ بوت المتصفح\n\n/psn - تشغيل سوني\n/stop_all - إيقاف\n/status - الإحصائيات")
 
 @bot.message_handler(commands=['start_all', 'psn'])
 def cmd_psn(m):
     if not is_owner(m): return
     stop_psn.clear()
     threading.Thread(target=worker_psn, args=(m.chat.id,), daemon=True).start()
-    bot.reply_to(m, "🚀 سوني (متصفح خفي) Started!")
+    bot.reply_to(m, "🚀 سوني (متصفح) Started!")
 
 @bot.message_handler(commands=['stop_all'])
 def cmd_stop_all(m):
@@ -138,7 +129,8 @@ def cmd_stop_all(m):
 def cmd_status(m):
     if not is_owner(m): return
     msg = (f"📊 **إحصائيات:**\n\n"
-           f"**سوني:** {stats['psn_found']} من {stats['psn_checked']}\n")
+           f"**سوني:** {stats['psn_found']} من {stats['psn_checked']}\n"
+           f"**أخطاء المتصفح:** {stats['psn_errors']}")
     bot.reply_to(m, msg, parse_mode='Markdown')
 
 # ==========================================
