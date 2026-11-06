@@ -36,13 +36,16 @@ psn_session = curl_requests.Session(impersonate="safari15_5")
 access_token = None
 token_lock = threading.Lock()
 
+# القيمة الصحيحة والرسمية من مكتبة PSNAWP
+CLIENT_BASIC_AUTH = "Basic MDk1MTUxNTktNzIzNy00MzcwLTliNDAtMzgwNmU2N2MwODkxOnVjUGprYTV0bnRCMktxc1A="
+
 def get_access_token(chat_id=None):
-    """تحويل NPSSO إلى Access Token وإرسال النتيجة للتليجرام"""
+    """تحويل NPSSO إلى Access Token باستخدام الـ Client ID الصحيح"""
     global access_token
     url = "https://ca.account.sony.com/api/authz/v3/oauth/token"
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
-        "Authorization": "Basic MDk1MTUxNTktNzU0OS00ZWNjLWI2NjAtN2M2M2M5N2Q4YjA5OkJocFJNcXl5c2R3",
+        "Authorization": CLIENT_BASIC_AUTH,
     }
     data = {
         "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
@@ -63,7 +66,6 @@ def get_access_token(chat_id=None):
                     bot.send_message(chat_id, "✅ تم استخراج توكن سوني بنجاح! البوت جاهز للفحص.")
                 return True
         
-        # إذا فشل الاستخراج
         error_msg = f"❌ فشل استخراج التوكن.\nكود: {res.status_code}\nالرد: {res.text[:100]}"
         print(error_msg)
         if chat_id:
@@ -80,7 +82,7 @@ def get_access_token(chat_id=None):
 def refresh_token_loop():
     while True:
         get_access_token()
-        time.sleep(1800) # كل 30 دقيقة
+        time.sleep(1800)
 
 threading.Thread(target=refresh_token_loop, daemon=True).start()
 
