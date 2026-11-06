@@ -36,24 +36,26 @@ psn_session = curl_requests.Session(impersonate="safari15_5")
 access_token = None
 token_lock = threading.Lock()
 
-# القيمة الصحيحة والرسمية من مكتبة PSNAWP
+# القيمة الصحيحة والرسمية للـ Client
 CLIENT_BASIC_AUTH = "Basic MDk1MTUxNTktNzIzNy00MzcwLTliNDAtMzgwNmU2N2MwODkxOnVjUGprYTV0bnRCMktxc1A="
 
 def get_access_token(chat_id=None):
-    """تحويل NPSSO إلى Access Token باستخدام الـ Client ID الصحيح"""
+    """تحويل NPSSO إلى Access Token بالطريقة الجديدة"""
     global access_token
     url = "https://ca.account.sony.com/api/authz/v3/oauth/token"
     headers = {
         "Content-Type": "application/x-www-form-urlencoded",
         "Authorization": CLIENT_BASIC_AUTH,
     }
+    
+    # الطريقة الجديدة (authorization_code بدل token-exchange)
     data = {
-        "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
-        "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
-        "subject_token": NPSSO_TOKEN,
-        "subject_token_type": "urn:ietf:params:oauth:token-type:npsso",
-        "scope": "psn:mobile.v2.core psn:clientapp",
+        "grant_type": "authorization_code",
+        "code": NPSSO_TOKEN,
+        "redirect_uri": "com.scee.psxandroid.scecompcall://redirect",
+        "token_format": "jwt",
     }
+    
     try:
         res = psn_session.post(url, headers=headers, data=data, timeout=10)
         if res.status_code == 200:
@@ -66,7 +68,7 @@ def get_access_token(chat_id=None):
                     bot.send_message(chat_id, "✅ تم استخراج توكن سوني بنجاح! البوت جاهز للفحص.")
                 return True
         
-        error_msg = f"❌ فشل استخراج التوكن.\nكود: {res.status_code}\nالرد: {res.text[:100]}"
+        error_msg = f"❌ فشل استخراج التوكن.\nكود: {res.status_code}\nالرد: {res.text[:150]}"
         print(error_msg)
         if chat_id:
             bot.send_message(chat_id, error_msg)
