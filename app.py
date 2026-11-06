@@ -5,7 +5,6 @@ import time
 import random
 import string
 import queue
-import json
 from flask import Flask
 from psnawp_api import PSNAWP
 from psnawp_api.core.psnawp_exceptions import PSNAWPNotFoundError, PSNAWPForbiddenError
@@ -16,7 +15,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Sony Producer-Consumer Bot is running!"
+    return "Sony Bot is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8000))
@@ -34,42 +33,16 @@ if not TOKEN or not OWNER_IDS_STR or not NPSSO_TOKEN:
 OWNER_IDS = [int(i.strip()) for i in OWNER_IDS_STR.split(",")]
 bot = telebot.TeleBot(TOKEN)
 
-# --- تهيئة PSNAWP وجلب التوكن ---
+# --- تهيئة PSNAWP ---
 psnawp = None
-access_token = None
-token_lock = threading.Lock()
-
-def init_sony():
-    global psnawp, access_token
-    try:
-        psnawp = PSNAWP(NPSSO_TOKEN)
-        psnawp.me()
-        print("✅ PSNAWP initialized.")
-        
-        # جلب التوكن بالقوة عشان المدقق
-        url = "https://ca.account.sony.com/api/authz/v3/oauth/token"
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "Authorization": "Basic MDk1MTUxNTktNzIzNy00MzcwLTliNDAtMzgwNmU2N2MwODkxOnVjUGprYTV0bnRCMktxc1A=",
-        }
-        data = {
-            "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
-            "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
-            "subject_token": NPSSO_TOKEN,
-            "subject_token_type": "urn:ietf:params:oauth:token-type:npsso",
-            "scope": "psn:mobile.v2.core psn:clientapp",
-        }
-        res = curl_requests.post(url, headers=headers, data=data, impersonate="safari15_5", timeout=10)
-        if res.status_code == 200:
-            with token_lock:
-                access_token = res.json().get("access_token")
-            print("✅ Token extracted manually.")
-            return True
-    except Exception as e:
-        print(f"❌ Init Error: {e}")
-    return False
-
-init_sony()
+init_error = None
+try:
+    psnawp = PSNAWP(NPSSO_TOKEN)
+    me = psnawp.me() # هذا السطر هو اللي يجبر المكتبة تجيب التوكن
+    print(f"✅ PSNAWP Logged in as: {me.online_id}")
+except Exception as e:
+    init_error = str(e)
+    print(f"❌ PSNAWP initialization error: {init_error}")
 
 stop_psn = threading.Event()
 stats = {"hunter_checked": 0, "verifier_found": 0, "queue_dropped": 0}
@@ -128,34 +101,38 @@ def verifier_worker(chat_id):
             continue
 
         try:
-            with token_lock:
-                token = access_token
-                
-            if not token:
-                # إذا اختفى التوكن، نجدد
-                init_sony()
-                time.sleep(2)
-                continue
-                
-            headers = {
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json",
-                "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X)"
-            }
-            url = f"https://accounts.api.playstation.com/api/v1/accounts/checkOnlineId?onlineId={u}"
-            res = curl_requests.get(url, headers=headers, impersonate="safari15_5", timeout=10)
+            # نسحب التوكن من داخل المكتبة مباشرة
+            token = getattr(psnawp.authenticator, '_access_token', None)
             
-            if res.status_code == 200:
-                data = res.json()
-                if data.get("available") is True:
-                    utype = "خماسي مكرر" if len(set(u)) < 5 else "خماسي"
-                    with stats_lock:
-                        stats["verifier_found"] += 1
-                    msg = f"استلم يالامير {u} 🎮🔥\n( سوني - {utype} - قاطع 100% )"
-                    bot.send_message(chat_id, msg)
-            elif res.status_code in [401, 403]:
-                init_sony() # توكن منتهي
-                time.sleep(5)
+            is_available = False
+            
+            if token:
+                headers = {
+                    "Authorization": f"Bearer {token}",
+                    "Accept": "application/json",
+                    "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X)"
+                }
+                url = f"https://accounts.api.playstation.com/api/v1/accounts/checkOnlineId?onlineId={u}"
+                res = curl_requests.get(url, headers=headers, impersonate="safari15_5", timeout=10)
+                
+                if res.status_code == 200 and res.json().get("available") is True:
+                    is_available = True
+            else:
+                # إذا ما فيه توكن، نستخدم الفحص المزدوج العادي كخطة بديلة
+                time.sleep(1)
+                try:
+                    psnawp.user(online_id=u)
+                except PSNAWPNotFoundError:
+                    is_available = True
+                except Exception:
+                    pass
+
+            if is_available:
+                utype = "خماسي مكرر" if len(set(u)) < 5 else "خماسي"
+                with stats_lock:
+                    stats["verifier_found"] += 1
+                msg = f"استلم يالامير {u} 🎮🔥\n( سوني - {utype} - متاح 100% )"
+                bot.send_message(chat_id, msg)
                 
             time.sleep(1)
             suspect_queue.task_done()
@@ -163,8 +140,8 @@ def verifier_worker(chat_id):
             time.sleep(1)
 
 def start_psn_snipers(chat_id):
-    if not psnawp or not access_token:
-        bot.send_message(chat_id, "❌ فشل الاتصال بسوني. التوكن غير متوفر. تأكد من NPSSO_TOKEN في المتغيرات.")
+    if not psnawp:
+        bot.send_message(chat_id, f"❌ فشل الاتصال بسوني.\nالسبب: `{init_error}`")
         return
         
     for i in range(10): 
@@ -178,7 +155,7 @@ def start_psn_snipers(chat_id):
 @bot.message_handler(commands=['start'])
 def cmd_start(m):
     if not is_owner(m): return
-    bot.reply_to(m, "☢️ بوت صيد يوزرات PSN\n\n/psn - تشغيل الصيد\n/stop_all - إيقاف\n/monitor - مراقبة النظام")
+    bot.reply_to(m, "☢️ بوت صيد يوزرات PSN\n\n/psn - تشغيل\n/stop_all - إيقاف\n/monitor - مراقبة\n/test - اختبار الاتصال")
 
 @bot.message_handler(commands=['psn'])
 def cmd_psn(m):
@@ -193,7 +170,7 @@ def cmd_psn(m):
         try: suspect_queue.get_nowait()
         except: break
         
-    bot.reply_to(m, "🚀 جاري تشغيل الصياد (10) + المدقق (2)...")
+    bot.reply_to(m, "🚀 جاري التشغيل...")
     start_psn_snipers(m.chat.id)
 
 @bot.message_handler(commands=['stop_all'])
@@ -208,9 +185,8 @@ def cmd_monitor(m):
     is_running = not stop_psn.is_set()
     sys_status = "🟢 يعمل" if is_running else "🔴 متوقف"
     
-    with token_lock:
-        has_token = access_token is not None
-    token_status = "✅ شغال" if has_token else "❌ غير متوفر"
+    token = getattr(psnawp.authenticator, '_access_token', None) if psnawp else None
+    token_status = "✅ شغال" if token else "❌ غير متوفر"
     
     with stats_lock:
         h_checked = stats["hunter_checked"]
@@ -218,21 +194,30 @@ def cmd_monitor(m):
         q_dropped = stats["queue_dropped"]
         q_size = suspect_queue.qsize()
     
-    msg = (f"🖥️ **لوحة مراقبة النظام**\n\n"
-           f"⚙️ **حالة البوت:** {sys_status}\n"
+    msg = (f"🖥️ **لوحة المراقبة**\n\n"
+           f"⚙️ **البوت:** {sys_status}\n"
            f"🔑 **التوكن:** {token_status}\n\n"
-           f"🏃‍♂️ **الصيادين (10 خيوط):**\n"
-           f"▪️ إجمالي الفحص: {h_checked} يوزر\n\n"
-           f"📥 **طابور التدقيق:**\n"
-           f"▪️ في الانتظار: {q_size} يوزر\n"
-           f"▪️ تم تخطيه (ممتلئ): {q_dropped} يوزر\n\n"
-           f"🕵️‍♂️ **المدققين (خيطين):**\n"
-           f"▪️ إجمالي الصيد: {v_found} يوزر")
+           f"🏃‍♂️ **الصيادين:** {h_checked} فحص\n"
+           f"📥 **الطابور:** {q_size} ينتظر | {q_dropped} تم تخطيه\n"
+           f"🕵️‍♂️ **المدققين:** {v_found} صيد")
     bot.reply_to(m, msg, parse_mode='Markdown')
+
+@bot.message_handler(commands=['test'])
+def cmd_test(m):
+    if not is_owner(m): return
+    if not psnawp:
+        bot.reply_to(m, f"❌ المكتبة فشلت في الاتصال:\n`{init_error}`")
+        return
+    
+    token = getattr(psnawp.authenticator, '_access_token', None)
+    if token:
+        bot.reply_to(m, "✅ المكتبة متصلة، والتوكن متوفر. جاهز للصيد.")
+    else:
+        bot.reply_to(m, "⚠️ المكتبة متصلة، لكن التوكن غير متوفر. سيعتمد البوت على الفحص المزدوج.")
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
-    print("Sony Producer-Consumer Bot is running...")
+    print("Sony Bot is running...")
     try: bot.delete_webhook(drop_pending_updates=True)
     except: pass
     bot.infinity_polling()
