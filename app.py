@@ -4,18 +4,17 @@ import threading
 import time
 import random
 import string
-import json
 from flask import Flask
-from curl_cffi import requests as curl_requests
 from psnawp_api import PSNAWP
 from psnawp_api.core.psnawp_exceptions import PSNAWPNotFoundError, PSNAWPForbiddenError
+from curl_cffi import requests as curl_requests
 
 # --- إعدادات Flask (لـ Render) ---
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "PSN Accurate Bot is running!"
+    return "PSN V9 is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8000))
@@ -33,39 +32,16 @@ if not TOKEN or not OWNER_IDS_STR or not NPSSO_TOKEN:
 OWNER_IDS = [int(i.strip()) for i in OWNER_IDS_STR.split(",")]
 bot = telebot.TeleBot(TOKEN)
 
-# --- متغيرات المصادقة ---
-access_token = None
-token_lock = threading.Lock()
-
-def get_access_token():
-    global access_token
-    url = "https://ca.account.sony.com/api/authz/v3/oauth/token"
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Authorization": "Basic MDk1MTUxNTktNzIzNy00MzcwLTliNDAtMzgwNmU2N2MwODkxOnVjUGprYTV0bnRCMktxc1A=",
-    }
-    data = {
-        "grant_type": "urn:ietf:params:oauth:grant-type:token-exchange",
-        "requested_token_type": "urn:ietf:params:oauth:token-type:access_token",
-        "subject_token": NPSSO_TOKEN,
-        "subject_token_type": "urn:ietf:params:oauth:token-type:npsso",
-        "scope": "psn:mobile.v2.core psn:clientapp",
-    }
-    try:
-        res = curl_requests.post(url, headers=headers, data=data, impersonate="safari15_5", timeout=10)
-        if res.status_code == 200:
-            with token_lock:
-                access_token = res.json().get("access_token")
-            print("✅ Access Token generated.")
-            return True
-        else:
-            print(f"❌ Token Error: {res.status_code} - {res.text}")
-    except Exception as e:
-        print(f"❌ Token Exception: {e}")
-    return False
-
-# جلب التوكن أول مرة
-get_access_token()
+# --- تهيئة PSNAWP ---
+psnawp = None
+init_error = None
+try:
+    psnawp = PSNAWP(NPSSO_TOKEN)
+    me = psnawp.me() # هذا السطر يجبر المكتبة على تسجيل الدخول
+    print(f"✅ PSNAWP Logged in as: {me.online_id}")
+except Exception as e:
+    init_error = str(e)
+    print(f"❌ PSNAWP initialization error: {init_error}")
 
 stop_psn = threading.Event()
 stats = {"checked": 0, "found": 0, "errors": 0}
@@ -79,42 +55,27 @@ def gen_psn():
         u = random.choice(string.ascii_lowercase) + "".join(random.choice(chars) for _ in range(4))
         yield u
 
-def check_psn_accurate(username):
-    global access_token
-    with token_lock:
-        token = access_token
-    
-    if not token:
-        get_access_token()
-        with token_lock:
-            token = access_token
-        if not token: return "NO_AUTH"
-
-    url = f"https://accounts.api.playstation.com/api/v1/accounts/checkOnlineId?onlineId={username}"
+# ==========================================
+# محرك الفحص (الموقع القديم)
+# ==========================================
+def check_psn_legacy(username):
+    # نضرب الرابط القديم اللي يرجع {} للمتاح
+    url = f"https://secure.us.playstation.com/playstation/psn/profile/public/userData?onlineId={username}"
     headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-        "Origin": "https://www.playstation.com",
-        "Referer": "https://www.playstation.com/",
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X)"
+        "Referer": "https://secure.us.playstation.com/logged-in/trophies/public-trophies/",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15"
     }
-    
     try:
         res = curl_requests.get(url, headers=headers, impersonate="safari15_5", timeout=10)
-        
         if res.status_code == 200:
-            if res.json().get("available") is True:
-                return True
-            return False
-        elif res.status_code in [401, 403]:
-            # التوكن انتهى أو مرفوض
-            get_access_token()
-            return "TOKEN_EXPIRED"
-        elif res.status_code == 429:
-            return "RATE_LIMIT"
+            if res.text.strip() == "{}":
+                return True # متاح
+            return False # محجوز
+        elif res.status_code in [403, 429]:
+            return "BLOCKED"
     except Exception:
-        return "ERROR"
-    return False
+        pass
+    return None
 
 def worker(chat_id):
     global stats
@@ -123,35 +84,53 @@ def worker(chat_id):
             u = next(gen_psn())
             with stats_lock: stats["checked"] += 1
             
-            res = check_psn_accurate(u)
-            
-            if res is True:
-                utype = "خماسي مكرر" if len(set(u)) < 5 else "خماسي"
-                with stats_lock: stats["found"] += 1
-                bot.send_message(chat_id, f"استلم يالامير {u} 🎮🔥\n( سوني - {utype} - قاطع 100% )")
-            elif res == "RATE_LIMIT":
-                time.sleep(15) # انتظار عند الحظر
-            elif res == "TOKEN_EXPIRED":
-                time.sleep(5)
-            elif res == "ERROR":
-                with stats_lock: stats["errors"] += 1
+            # فحص إضافي عبر PSNAWP عشان نتأكد إذا كان الحساب خاص
+            is_private = False
+            try:
+                psnawp.user(online_id=u)
+                # إذا لقاه هنا، يعني محجوز أكيد
+                with stats_lock: stats["checked"] += 1 # نحسبها كفحصين
+                is_private = True 
+            except PSNAWPForbiddenError:
+                is_private = True
+            except PSNAWPNotFoundError:
+                pass # قد يكون متاح، نكمل
+            except Exception:
+                pass
+
+            if not is_private:
+                res = check_psn_legacy(u)
                 
-            # السرعة الآمنة جداً لمنع الحظر (4 ثواني بين كل فحص)
-            time.sleep(4)
+                if res is True:
+                    utype = "خماسي مكرر" if len(set(u)) < 5 else "خماسي"
+                    with stats_lock: stats["found"] += 1
+                    bot.send_message(chat_id, f"استلم يالامير {u} 🎮🔥\n( سوني - {utype} - متاح )")
+                elif res == "BLOCKED":
+                    time.sleep(10)
+                    continue
+            else:
+                res = "BLOCKED" # محجوز
+
+            # سرعة آمنة لمنع الحظر
+            time.sleep(3)
             
         except Exception:
+            with stats_lock: stats["errors"] += 1
             time.sleep(2)
 
-def start_sniper(chat_id):
-    if not access_token:
-        bot.send_message(chat_id, "❌ فشل جلب التوكن. تأكد من NPSSO في المتغيرات.")
+def start_psn_snipers(chat_id):
+    if not psnawp:
+        bot.send_message(chat_id, f"❌ فشل الاتصال بسوني.\nالسبب: `{init_error}`")
         return
     threading.Thread(target=worker, args=(chat_id,), daemon=True).start()
 
+# ==========================================
+# أوامر البوت
+# ==========================================
 @bot.message_handler(commands=['start'])
 def cmd_start(m):
     if not is_owner(m): return
-    bot.reply_to(m, "☢️ بوت سوني (القاطع الرسمي)\n\n/psn - تشغيل الصيد\n/stop_all - إيقاف\n/status - الإحصائيات")
+    bot.reply_to(m, "☢️ PSN V9 Bot\n\n/psn - تشغيل\n/stop_all - إيقاف\n/status - الإحصائيات")
 
 @bot.message_handler(commands=['psn'])
 def cmd_psn(m):
@@ -161,8 +140,8 @@ def cmd_psn(m):
         stats["checked"] = 0
         stats["found"] = 0
         stats["errors"] = 0
-    bot.reply_to(m, "🚀 جاري التشغيل (سرعة آمنة جداً)...")
-    start_sniper(m.chat.id)
+    bot.reply_to(m, "🚀 جاري التشغيل...")
+    start_psn_snipers(m.chat.id)
 
 @bot.message_handler(commands=['stop_all'])
 def cmd_stop_all(m):
@@ -182,12 +161,12 @@ def cmd_status(m):
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
-    print("Sony Accurate Bot is running...")
+    print("Sony V9 is running...")
     try: bot.delete_webhook(drop_pending_updates=True)
     except: pass
     
     while True:
         try:
             bot.polling(non_stop=True, interval=0, timeout=60)
-        except Exception as e:
+        except Exception:
             time.sleep(5)
