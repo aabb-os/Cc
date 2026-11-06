@@ -1,6 +1,3 @@
-pyTelegramBotAPI
-requests
-curl_cffi
-PSNAWP
-Flask
-playwright
+pyTelegramBotAPI==4.15.0
+curl_cffi>=0.5.9
+Flask==3.0.0
