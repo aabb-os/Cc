@@ -4,16 +4,18 @@ import threading
 import time
 import random
 import string
+import json
 from flask import Flask
 from psnawp_api import PSNAWP
 from psnawp_api.core.psnawp_exceptions import PSNAWPNotFoundError, PSNAWPForbiddenError
+from curl_cffi import requests as curl_requests
 
 # --- إعدادات Flask (لـ Render) ---
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Sony Accurate Bot is running!"
+    return "Sony Ultimate Bot is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8000))
@@ -56,38 +58,50 @@ def gen_psn():
         yield u
 
 # ==========================================
-# محرك الفحص (سوني فقط + تأكيد مزدوج)
+# محرك الفحص مع الفحص القاطع (Decisive Check)
 # ==========================================
-def check_psn_accurate(username):
+def check_psn_ultimate(username):
     if not psnawp:
         return "NO_AUTH"
         
-    # الفحص الأول
+    # الفحص الأول: PSNAWP
     try:
         psnawp.user(online_id=username)
         return False # محجوز
     except PSNAWPForbiddenError:
         return False # حساب خاص = محجوز
     except PSNAWPNotFoundError:
-        pass # ربما متاح، نكمل
+        pass # ربما متاح، نكمل للفحص القاطع
     except Exception as e:
         if "429" in str(e) or "RateLimit" in str(e):
             return "BLOCKED"
         return None
 
-    # انتظار بسيط للتأكيد
-    time.sleep(2.0)
-
-    # الفحص الثاني (للتأكيد)
+    # الفحص القاطع: رابط تغيير الاسم الرسمي في سوني
     try:
-        psnawp.user(online_id=username)
-        return False
-    except PSNAWPForbiddenError:
-        return False
-    except PSNAWPNotFoundError:
-        return True # متاح 100% (عدى الفحصين بنجاح)
+        # سحب التوكن الحالي من المكتبة
+        token = psnawp.authenticator._access_token
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Origin": "https://www.playstation.com",
+            "Referer": "https://www.playstation.com/"
+        }
+        url = f"https://accounts.api.playstation.com/api/v1/accounts/checkOnlineId?onlineId={username}"
+        
+        res = curl_requests.get(url, headers=headers, impersonate="safari15_5", timeout=10)
+        
+        if res.status_code == 200:
+            data = res.json()
+            if data.get("available") is True:
+                return True # متاح 100% (حكم سوني النهائي)
+            return False # محجوز
+        elif res.status_code in [401, 403, 429]:
+            return "BLOCKED"
     except Exception:
-        return None
+        pass
+        
+    return None # إذا فشل الفحص القاطع، لا نرسله
 
 # ==========================================
 # دالة التشغيل
@@ -102,7 +116,7 @@ def human_worker(chat_id):
                 stats["total_checked"] += 1
                 current_checked = stats["total_checked"]
             
-            res = check_psn_accurate(u)
+            res = check_psn_ultimate(u)
             
             if res is True:
                 if len(set(u)) < 5:
@@ -126,7 +140,6 @@ def human_worker(chat_id):
             if current_checked % 100 == 0:
                 bot.send_message(chat_id, f"🔄 جاري الفحص... (فحص {current_checked})")
                 
-            # تأخير بسيط جداً عشان نوازن بين السرعة والأمان
             time.sleep(random.uniform(1.0, 2.0))
             
         except Exception as e:
@@ -137,7 +150,7 @@ def start_psn_snipers(chat_id):
         bot.send_message(chat_id, "❌ فشل الاتصال بسوني. تأكد من NPSSO_TOKEN.")
         return
         
-    # 3 خيوط (سرعة ممتازة، وحماية من الحظر)
+    # 3 خيوط (نفس السرعة اللي عجبتك)
     for i in range(3): 
         threading.Thread(target=human_worker, args=(chat_id,), daemon=True).start()
         time.sleep(0.2)
@@ -148,13 +161,13 @@ def start_psn_snipers(chat_id):
 @bot.message_handler(commands=['start'])
 def cmd_start(m):
     if not is_owner(m): return
-    bot.reply_to(m, "☢️ بوت صيد يوزرات PSN (دقة 100% - بدون مواقع خارجية)\n\n/psn - تشغيل الصيد\n/stop_all - إيقاف\n/status - الإحصائيات")
+    bot.reply_to(m, "☢️ بوت صيد يوزرات PSN (الفحص القاطع)\n\n/psn - تشغيل الصيد\n/stop_all - إيقاف\n/status - الإحصائيات")
 
 @bot.message_handler(commands=['psn'])
 def cmd_psn(m):
     if not is_owner(m): return
     stop_psn.clear()
-    bot.reply_to(m, "🚀 جاري تشغيل الصيد (تحقق مزدوج من سوني)...")
+    bot.reply_to(m, "🚀 جاري تشغيل الصيد (الفحص القاطع النهائي)...")
     start_psn_snipers(m.chat.id)
 
 @bot.message_handler(commands=['stop_all'])
@@ -177,7 +190,7 @@ def cmd_status(m):
 # ==========================================
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
-    print("Sony Accurate Bot is running...")
+    print("Sony Ultimate Bot is running...")
     try: bot.delete_webhook(drop_pending_updates=True)
     except: pass
     bot.infinity_polling()
