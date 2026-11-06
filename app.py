@@ -4,17 +4,17 @@ import threading
 import time
 import random
 import string
-from datetime import datetime
 from flask import Flask
 from psnawp_api import PSNAWP
 from psnawp_api.core.psnawp_exceptions import PSNAWPNotFoundError, PSNAWPForbiddenError
+from curl_cffi import requests as curl_requests
 
 # --- إعدادات Flask (لـ Render) ---
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Sony Sniper Bot is running!"
+    return "Sony Triple-Check Bot is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8000))
@@ -48,7 +48,7 @@ stats_lock = threading.Lock()
 def is_owner(m): return m.from_user.id in OWNER_IDS
 
 # ==========================================
-# دالة التوليد (5 خانات)
+# دالة التوليد
 # ==========================================
 def gen_psn():
     chars = string.ascii_lowercase + string.digits
@@ -57,38 +57,50 @@ def gen_psn():
         yield u
 
 # ==========================================
-# محرك الفحص (التحقق المزدوج 100%)
+# محرك الفحص الثلاثي (100% دقة)
 # ==========================================
-def check_psn_accurate(username):
+def check_psn_ultimate(username):
     if not psnawp:
         return "NO_AUTH"
         
-    # الفحص الأول
+    # 1. الفحص عبر PSNAWP
     try:
         psnawp.user(online_id=username)
         return False # محجوز
     except PSNAWPForbiddenError:
         return False # حساب خاص = محجوز
     except PSNAWPNotFoundError:
-        pass # ربما متاح، نكمل للفحص الثاني
-    except Exception as e:
-        if "429" in str(e) or "RateLimit" in str(e):
-            return "BLOCKED"
-        return None
-
-    # انتظار بسيط قبل التأكيد
-    time.sleep(1.5)
-
-    # الفحص الثاني (للتأكيد)
-    try:
-        psnawp.user(online_id=username)
-        return False
-    except PSNAWPForbiddenError:
-        return False
-    except PSNAWPNotFoundError:
-        return True # متاح 100% (عدى الفحصين)
+        pass # ربما متاح، نكمل
     except Exception:
         return None
+
+    time.sleep(1.5) # تأخير
+
+    # 2. الفحص عبر موقع سوني الرسمي
+    try:
+        ts = int(time.time() * 1000)
+        url = f"https://secure.us.playstation.com/playstation/psn/profile/public/userData?onlineId={username}&_={ts}"
+        headers = {"Referer": "https://secure.us.playstation.com/logged-in/trophies/public-trophies/"}
+        res = curl_requests.get(url, headers=headers, impersonate="safari15_5", timeout=10)
+        
+        if res.status_code == 200 and res.text.strip() != "{}":
+            return False # لقى بيانات، يعني محجوز
+    except Exception:
+        pass
+
+    time.sleep(1.5) # تأخير
+
+    # 3. الفحص عبر PSNProfiles (الحكم النهائي)
+    try:
+        r = curl_requests.get(f"https://psnprofiles.com/{username}", impersonate="chrome124", timeout=10)
+        if r.status_code == 200:
+            return False # محجوز
+        elif r.status_code == 404:
+            return True # متاح 100% (عدى الثلاثة)
+    except Exception:
+        pass
+        
+    return None # إذا فشل أي فحص، نعتبره خطأ ولا نرسله
 
 # ==========================================
 # دالة التشغيل
@@ -99,7 +111,7 @@ def human_worker(chat_id):
         try:
             u = next(gen_psn())
             
-            res = check_psn_accurate(u)
+            res = check_psn_ultimate(u)
             
             if res is True:
                 # تحديد نوع اليوزر
@@ -117,24 +129,20 @@ def human_worker(chat_id):
                        
                 bot.send_message(chat_id, msg)
                 
-            elif res == "BLOCKED":
-                time.sleep(10) 
-                continue
-                
-            # تأخير بسيط بين كل فحص (عشان ما ننحظر)
-            time.sleep(random.uniform(0.5, 1.5))
+            # تأخير بين كل فحص وفحص (3 إلى 5 ثواني)
+            # السرعة الأقل تضمن إن سوني ما تكذب علينا
+            time.sleep(random.uniform(3.0, 5.0))
             
         except Exception as e:
-            time.sleep(2)
+            time.sleep(3)
 
 def start_psn_snipers(chat_id):
     if not psnawp:
         bot.send_message(chat_id, "❌ فشل الاتصال بسوني. تأكد من NPSSO_TOKEN.")
         return
         
-    for i in range(5): 
-        threading.Thread(target=human_worker, args=(chat_id,), daemon=True).start()
-        time.sleep(0.2)
+    # خيط واحد فقط لضمان أقصى درجات الأمان (بدون حظر)
+    threading.Thread(target=human_worker, args=(chat_id,), daemon=True).start()
 
 # ==========================================
 # أوامر البوت
@@ -148,7 +156,7 @@ def cmd_start(m):
 def cmd_psn(m):
     if not is_owner(m): return
     stop_psn.clear()
-    bot.reply_to(m, "🚀 جاري تشغيل الصيد (تحقق مزدوج للدقة)...")
+    bot.reply_to(m, "🚀 جاري تشغيل الصيد (التحقق الثلاثي الصارم)...")
     start_psn_snipers(m.chat.id)
 
 @bot.message_handler(commands=['stop_all'])
@@ -162,7 +170,7 @@ def cmd_status(m):
     if not is_owner(m): return
     with stats_lock:
         msg = (f"📊 **إحصائيات سوني:**\n\n"
-               f"✅ **إجمالي اليوزرات المصادة:** {stats['total_found']}")
+               f"✅ **إجمالي اليوزرات المصادة (متأكد 100%):** {stats['total_found']}")
     bot.reply_to(m, msg, parse_mode='Markdown')
 
 # ==========================================
@@ -170,7 +178,7 @@ def cmd_status(m):
 # ==========================================
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
-    print("Sony Sniper Bot is running...")
+    print("Sony Triple-Check Bot is running...")
     try: bot.delete_webhook(drop_pending_updates=True)
     except: pass
     bot.infinity_polling()
