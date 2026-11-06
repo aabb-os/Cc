@@ -4,18 +4,16 @@ import threading
 import time
 import random
 import string
+import datetime
 from flask import Flask
-from psnawp_api import PSNAWP
-from psnawp_api.core.psnawp_exceptions import PSNAWPNotFoundError, PSNAWPForbiddenError
 from curl_cffi import requests as curl_requests
-from concurrent.futures import ThreadPoolExecutor
 
 # --- إعدادات Flask (لـ Render) ---
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "PSN V9 is running!"
+    return "PSN V9 Sniper is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8000))
@@ -24,25 +22,13 @@ def run_flask():
 # --- الإعدادات الأساسية ---
 TOKEN = os.environ.get("BOT_TOKEN")
 OWNER_IDS_STR = os.environ.get("OWNER_ID")
-NPSSO_TOKEN = os.environ.get("NPSSO_TOKEN")
 
-if not TOKEN or not OWNER_IDS_STR or not NPSSO_TOKEN:
-    print("❌ خطأ: تأكد من BOT_TOKEN و OWNER_ID و NPSSO_TOKEN.")
+if not TOKEN or not OWNER_IDS_STR:
+    print("❌ خطأ: تأكد من BOT_TOKEN و OWNER_ID.")
     exit(1)
 
 OWNER_IDS = [int(i.strip()) for i in OWNER_IDS_STR.split(",")]
 bot = telebot.TeleBot(TOKEN)
-
-# --- تهيئة PSNAWP ---
-psnawp = None
-init_error = None
-try:
-    psnawp = PSNAWP(NPSSO_TOKEN)
-    me = psnawp.me() 
-    print(f"✅ PSNAWP Logged in as: {me.online_id}")
-except Exception as e:
-    init_error = str(e)
-    print(f"❌ PSNAWP initialization error: {init_error}")
 
 # --- إعداد البروكسي ---
 def load_proxies():
@@ -65,28 +51,30 @@ def get_proxy():
 
 # --- متغيرات التحكم ---
 stop_psn = threading.Event()
-stats = {"checked": 0, "found": 0, "errors": 0, "blocked": 0}
+stats = {"checked": 0, "found": 0, "errors": 0}
 stats_lock = threading.Lock()
-MAX_THREADS = 10
+MAX_THREADS = 25 # زيادة الخيوط لزيادة السرعة
 
 def is_owner(m): return m.from_user.id in OWNER_IDS
 
+# توليد أسماء 5 أحرف (حرف + 4 أحرف/أرقام) لزيادة فرصة الإيجاد
 def gen_psn():
-    # توليد أسماء بأطوال مختلفة (3، 4، 5) لزيادة فرصة الإيجاد
     chars = string.ascii_lowercase + string.digits
-    length = random.choice([3, 4, 5])
     while True:
-        u = random.choice(string.ascii_lowercase) + "".join(random.choice(chars) for _ in range(length - 1))
+        u = random.choice(string.ascii_lowercase) + "".join(random.choice(chars) for _ in range(4))
         yield u
 
 # ==========================================
-# محرك الفحص (الموقع القديم)
+# محرك الفحص (الموقع القديم - سريع جداً)
 # ==========================================
 def check_psn_legacy(username):
     url = f"https://secure.us.playstation.com/playstation/psn/profile/public/userData?onlineId={username}"
     headers = {
+        "Host": "secure.us.playstation.com",
+        "Accept": "*/*",
+        "X-Requested-With": "XMLHttpRequest",
+        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1",
         "Referer": "https://secure.us.playstation.com/logged-in/trophies/public-trophies/",
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15"
     }
     proxy = get_proxy()
     
@@ -95,7 +83,7 @@ def check_psn_legacy(username):
             url, 
             headers=headers, 
             impersonate="safari15_5", 
-            timeout=10, 
+            timeout=8, 
             proxy=proxy
         )
         if res.status_code == 200:
@@ -104,60 +92,51 @@ def check_psn_legacy(username):
             return False # محجوز
         elif res.status_code in [403, 429]:
             return "BLOCKED"
-        else:
-            return "ERROR"
-    except Exception as e:
+    except Exception:
         return "ERROR"
+    return "ERROR"
 
 def worker(chat_id, psn_gen):
+    global stats
     while not stop_psn.is_set():
         try:
             u = next(psn_gen)
             
-            # الفحص الأول عبر PSNAWP (سريع لكن محدود)
-            is_available = False
-            try:
-                psnawp.user(online_id=u)
-                # إذا لم يرمي خطأ، يعني الحساب موجود
-                is_available = False 
-            except PSNAWPNotFoundError:
-                is_available = True # غير موجود، قد يكون متاح
-            except PSNAWPForbiddenError:
-                is_available = False # محظور أو خاص
-            except Exception:
-                continue # خطأ في الشبكة، تخطى هذا الاسم
-                
-            if is_available:
-                # الفحص الثاني عبر الموقع القديم للتأكيد
-                res = check_psn_legacy(u)
-                
-                with stats_lock:
-                    stats["checked"] += 1
-                    if res is True:
-                        stats["found"] += 1
-                        utype = "ثلاثي" if len(u) == 3 else ("رباعي" if len(u) == 4 else "خماسي")
-                        if len(set(u)) < len(u): utype += " مكرر"
-                        bot.send_message(chat_id, f"استلم يالامير {u} 🎮🔥\n( سوني - {utype} - متاح )")
-                    elif res == "BLOCKED":
-                        stats["blocked"] += 1
-                        time.sleep(15) # انتظار طويل لو محظور
-                    elif res == "ERROR":
-                        stats["errors"] += 1
-
-            # سرعة آمنة
-            time.sleep(random.uniform(1.5, 3.0))
+            with stats_lock: 
+                stats["checked"] += 1
             
+            res = check_psn_legacy(u)
+            
+            if res is True:
+                with stats_lock: 
+                    stats["found"] += 1
+                    total_found = stats["found"]
+                
+                # النص مطابق 100% للصور
+                current_time = datetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
+                msg_text = (
+                    f"🎯 يوزر PSN متاح!\n"
+                    f"👤 {u}\n"
+                    f"⏰ {current_time}\n"
+                    f"📊 إجمالي: {total_found}"
+                )
+                bot.send_message(chat_id, msg_text)
+                
+                time.sleep(1) # استراحة بسيطة بعد الإيجاد
+                
+            elif res == "BLOCKED":
+                # إذا تم حظرنا، ننام فترة أطول لتجنب الحظر النهائي
+                time.sleep(random.uniform(10, 20)) 
+            else:
+                # سرعة عالية عند الفحص العادي
+                time.sleep(random.uniform(0.5, 1.5))
+                
         except Exception:
             with stats_lock: stats["errors"] += 1
             time.sleep(2)
 
 def start_psn_snipers(chat_id):
-    if not psnawp:
-        bot.send_message(chat_id, f"❌ فشل الاتصال بسوني.\nالسبب: `{init_error}`")
-        return
-    
     psn_gen = gen_psn()
-    # تشغيل عدة Threads لزيادة السرعة
     for _ in range(MAX_THREADS):
         threading.Thread(target=worker, args=(chat_id, psn_gen), daemon=True).start()
 
@@ -167,7 +146,7 @@ def start_psn_snipers(chat_id):
 @bot.message_handler(commands=['start'])
 def cmd_start(m):
     if not is_owner(m): return
-    bot.reply_to(m, "☢️ PSN V9 Bot\n\n/psn - تشغيل\n/stop_all - إيقاف\n/status - الإحصائيات")
+    bot.reply_to(m, "☢️ PSN V9 Sniper\n\n/psn - تشغيل\n/stop_all - إيقاف\n/status - الإحصائيات")
 
 @bot.message_handler(commands=['psn'])
 def cmd_psn(m):
@@ -177,7 +156,6 @@ def cmd_psn(m):
         stats["checked"] = 0
         stats["found"] = 0
         stats["errors"] = 0
-        stats["blocked"] = 0
     bot.reply_to(m, f"🚀 جاري التشغيل بـ {MAX_THREADS} خيوط...")
     start_psn_snipers(m.chat.id)
 
@@ -194,13 +172,12 @@ def cmd_status(m):
         msg = (f"📊 **الإحصائيات:**\n"
                f"🔍 الفحص: {stats['checked']}\n"
                f"✅ المتاح: {stats['found']}\n"
-               f"⚠️ أخطاء: {stats['errors']}\n"
-               f"🚫 محظور (IP): {stats['blocked']}")
+               f"⚠️ أخطاء: {stats['errors']}")
     bot.reply_to(m, msg, parse_mode='Markdown')
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
-    print("Sony V9 is running...")
+    print("Sony V9 Sniper is running...")
     try: bot.delete_webhook(drop_pending_updates=True)
     except: pass
     
