@@ -48,16 +48,14 @@ stats = {"psn_checked": 0, "psn_found": 0, "psn_private": 0}
 def is_owner(m): return m.from_user.id in OWNER_IDS
 
 # ==========================================
-# دالة التوليد (7 خانات + حرف مكرر)
+# دالة التوليد (5 خانات عشوائية)
 # ==========================================
 def gen_psn():
     chars = string.ascii_lowercase + string.digits
     while True:
-        # نولد 7 خانات
-        u = random.choice(string.ascii_lowercase) + "".join(random.choice(chars) for _ in range(6))
-        # لازم يكون فيه حرف/رقم مكرر
-        if len(set(u)) < 7: 
-            yield u
+        # 5 خانات، تبدأ بحرف (عشان قوانين سوني)
+        u = random.choice(string.ascii_lowercase) + "".join(random.choice(chars) for _ in range(4))
+        yield u
 
 # ==========================================
 # محرك فحص سوني (دقيق 100%)
@@ -94,7 +92,7 @@ def worker_psn(chat_id, thread_id):
             
             if res is True:
                 stats["psn_found"] += 1
-                bot.send_message(chat_id, f"استلم يالامير {u} 🎮🥷🏼\n( سوني - 7 خانات مكرر )")
+                bot.send_message(chat_id, f"استلم يالامير {u} 🎮🥷🏼\n( سوني - 5 خانات )")
             elif res == "BLOCKED":
                 time.sleep(30)
                 continue
@@ -123,13 +121,13 @@ def start_psn_snipers(chat_id):
 def cmd_start(m):
     if not is_owner(m): return
     status = "✅ متصل" if psnawp else "❌ غير متصل"
-    bot.reply_to(m, f"☢️ بوت سوني (7 خانات للنتائج السريعة)\nالحالة: {status}\n\n/psn - تشغيل الصيد\n/stop_all - إيقاف\n/status - الإحصائيات")
+    bot.reply_to(m, f"☢️ بوت سوني (5 خانات)\nالحالة: {status}\n\n/psn - تشغيل الصيد\n/stop_all - إيقاف\n/status - الإحصائيات")
 
 @bot.message_handler(commands=['psn'])
 def cmd_psn(m):
     if not is_owner(m): return
     stop_psn.clear()
-    bot.reply_to(m, "🚀 جاري تشغيل 5 خيوط (7 خانات) لضمان النتائج...")
+    bot.reply_to(m, "🚀 جاري تشغيل 5 خيوط (5 خانات)...")
     start_psn_snipers(m.chat.id)
 
 @bot.message_handler(commands=['stop_all'])
