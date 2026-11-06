@@ -42,15 +42,13 @@ except Exception as e:
     print(f"❌ PSNAWP initialization error: {e}")
 
 stop_psn = threading.Event()
-
-# العداد لعدد اليوزرات اللي تم صيدها (مثل الصورة)
 stats = {"total_found": 0}
 stats_lock = threading.Lock()
 
 def is_owner(m): return m.from_user.id in OWNER_IDS
 
 # ==========================================
-# دالة التوليد
+# دالة التوليد (5 خانات)
 # ==========================================
 def gen_psn():
     chars = string.ascii_lowercase + string.digits
@@ -59,21 +57,37 @@ def gen_psn():
         yield u
 
 # ==========================================
-# محرك الفحص
+# محرك الفحص (التحقق المزدوج 100%)
 # ==========================================
 def check_psn_accurate(username):
     if not psnawp:
         return "NO_AUTH"
+        
+    # الفحص الأول
     try:
         psnawp.user(online_id=username)
         return False # محجوز
     except PSNAWPForbiddenError:
         return False # حساب خاص = محجوز
     except PSNAWPNotFoundError:
-        return True # متاح 100%
+        pass # ربما متاح، نكمل للفحص الثاني
     except Exception as e:
         if "429" in str(e) or "RateLimit" in str(e):
             return "BLOCKED"
+        return None
+
+    # انتظار بسيط قبل التأكيد
+    time.sleep(1.5)
+
+    # الفحص الثاني (للتأكيد)
+    try:
+        psnawp.user(online_id=username)
+        return False
+    except PSNAWPForbiddenError:
+        return False
+    except PSNAWPNotFoundError:
+        return True # متاح 100% (عدى الفحصين)
+    except Exception:
         return None
 
 # ==========================================
@@ -88,37 +102,36 @@ def human_worker(chat_id):
             res = check_psn_accurate(u)
             
             if res is True:
+                # تحديد نوع اليوزر
+                if len(set(u)) < 5:
+                    utype = "خماسي مكرر"
+                else:
+                    utype = "خماسي"
+                    
                 with stats_lock:
                     stats["total_found"] += 1
-                    current_total = stats["total_found"]
                     
-                # جلب الوقت الحالي بنفس تنسيق الصورة
-                now = datetime.now().strftime("%Y/%m/%d %H:%M:%S")
-                
-                # نفس الرسالة اللي في صورتك بالضبط
-                msg = (f"🎯 يوزر PSN متاح!\n"
-                       f"👤 {u}\n"
-                       f"⏰ {now}\n"
-                       f"📊 إجمالي: {current_total}")
+                # الرد بالصيغة المطلوبة
+                msg = (f"استلم يالامير {u} 🎮🔥\n"
+                       f"( سوني - {utype} )")
                        
                 bot.send_message(chat_id, msg)
                 
             elif res == "BLOCKED":
-                time.sleep(5) 
+                time.sleep(10) 
                 continue
                 
-            # سرعة عالية جداً
-            time.sleep(random.uniform(0.3, 1.0))
+            # تأخير بسيط بين كل فحص (عشان ما ننحظر)
+            time.sleep(random.uniform(0.5, 1.5))
             
         except Exception as e:
-            time.sleep(1)
+            time.sleep(2)
 
 def start_psn_snipers(chat_id):
     if not psnawp:
         bot.send_message(chat_id, "❌ فشل الاتصال بسوني. تأكد من NPSSO_TOKEN.")
         return
         
-    # 5 خيوط للسرعة القصوى
     for i in range(5): 
         threading.Thread(target=human_worker, args=(chat_id,), daemon=True).start()
         time.sleep(0.2)
@@ -129,13 +142,13 @@ def start_psn_snipers(chat_id):
 @bot.message_handler(commands=['start'])
 def cmd_start(m):
     if not is_owner(m): return
-    bot.reply_to(m, "☢️ بوت صيد يوزرات PSN (مطابق للصورة)\n\n/psn - تشغيل الصيد\n/stop_all - إيقاف\n/status - الإحصائيات")
+    bot.reply_to(m, "☢️ بوت صيد يوزرات PSN (دقة 100%)\n\n/psn - تشغيل الصيد\n/stop_all - إيقاف\n/status - الإحصائيات")
 
 @bot.message_handler(commands=['psn'])
 def cmd_psn(m):
     if not is_owner(m): return
     stop_psn.clear()
-    bot.reply_to(m, "🚀 جاري تشغيل الصيد... خله يشتغل ولا توقفه.")
+    bot.reply_to(m, "🚀 جاري تشغيل الصيد (تحقق مزدوج للدقة)...")
     start_psn_snipers(m.chat.id)
 
 @bot.message_handler(commands=['stop_all'])
