@@ -1,368 +1,257 @@
+# app.py
+# يشتغل كـ: gunicorn app:app
+
 import os
-import time
+import signal
 import random
 import string
 import threading
-import datetime
-import html
+import time
 import logging
 from dataclasses import dataclass, field
+from typing import Optional
 
 import telebot
 from flask import Flask
+from psnawp_api import PSNAWP
+from psnawp_api.core.psnawp_exceptions import (
+    PSNAWPNotFoundError,
+    PSNAWPForbiddenError,
+    PSNAWPAuthenticationError,
+)
 from curl_cffi import requests as curl_requests
 
-# ─────────────────────────────────────────────
-# Logging
-# ─────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
-)
-log = logging.getLogger("psn-sniper")
+log = logging.getLogger("psn_bot")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
+# ============ Config ============
+TOKEN = os.environ.get("BOT_TOKEN")
+OWNER_IDS_STR = os.environ.get("OWNER_ID")
+NPSSO_TOKEN = os.environ.get("NPSSO_TOKEN")
 
-# ─────────────────────────────────────────────
-# Flask (health check for Render)
-# ─────────────────────────────────────────────
+if not TOKEN or not OWNER_IDS_STR or not NPSSO_TOKEN:
+    log.error("ENV missing: BOT_TOKEN/OWNER_ID/NPSSO_TOKEN")
+    TOKEN = TOKEN or "MISSING"
+    OWNER_IDS_STR = OWNER_IDS_STR or "0"
+    NPSSO_TOKEN = NPSSO_TOKEN or "MISSING"
+
+OWNER_IDS = {int(x.strip()) for x in OWNER_IDS_STR.split(",") if x.strip().isdigit()}
+
+# ============ Flask app ============
 app = Flask(__name__)
-
 
 @app.route("/")
 def home():
-    return "PSN Sniper is running!"
+    return "PSN V9 is running!"
 
+@app.route("/health")
+def health():
+    s = stats.snapshot()
+    return {"status": "ok", "stats": s, "psnawp_ready": psnawp is not None}
 
-def run_flask() -> None:
-    port = int(os.environ.get("PORT", 8000))
-    app.run(host="0.0.0.0", port=port)
-
-
-# ─────────────────────────────────────────────
-# Config
-# ─────────────────────────────────────────────
-TOKEN = os.environ.get("BOT_TOKEN")
-OWNER_IDS_STR = os.environ.get("OWNER_ID")
-
-if not TOKEN or not OWNER_IDS_STR:
-    log.error("BOT_TOKEN و OWNER_ID مطلوبان.")
-    raise SystemExit(1)
-
-try:
-    OWNER_IDS = {int(i.strip()) for i in OWNER_IDS_STR.split(",") if i.strip()}
-except ValueError:
-    log.error("OWNER_ID يجب أن يكون أرقاماً مفصولة بفواصل.")
-    raise SystemExit(1)
-
+# ============ Bot & PSNAWP ============
 bot = telebot.TeleBot(TOKEN, parse_mode=None)
 
+psnawp: Optional[PSNAWP] = None
+init_error: Optional[str] = None
+try:
+    psnawp = PSNAWP(NPSSO_TOKEN)
+    me = psnawp.me()
+    log.info("PSNAWP logged in as %s", me.online_id)
+except PSNAWPAuthenticationError as e:
+    init_error = f"NPSSO منتهي: {e}"
+    log.error(init_error)
+except Exception as e:
+    init_error = str(e)
+    log.error("PSNAWP init failed: %s", e)
 
-# ─────────────────────────────────────────────
-# Proxies (hot reloadable)
-# ─────────────────────────────────────────────
-class ProxyPool:
-    def __init__(self, path: str = "proxies.txt"):
-        self.path = path
-        self._lock = threading.Lock()
-        self._items: list[str] = []
-        self.reload()
+# ============ State ============
+stop_psn = threading.Event()
+shutdown_event = threading.Event()
+_bot_started = threading.Event()
 
-    def reload(self) -> int:
-        items: list[str] = []
-        if os.path.exists(self.path):
-            try:
-                with open(self.path, "r", encoding="utf-8") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith("#"):
-                            items.append(line)
-            except OSError as e:
-                log.warning("فشل قراءة %s: %s", self.path, e)
-        with self._lock:
-            self._items = items
-            return len(items)
-
-    def pick(self) -> str | None:
-        with self._lock:
-            if not self._items:
-                return None
-            return random.choice(self._items)
-
-    def __len__(self) -> int:
-        with self._lock:
-            return len(self._items)
-
-
-proxies = ProxyPool()
-
-
-# ─────────────────────────────────────────────
-# Shared state
-# ─────────────────────────────────────────────
 @dataclass
 class Stats:
     checked: int = 0
     found: int = 0
     errors: int = 0
-    _lock: threading.Lock = field(default_factory=threading.Lock)
+    lock: threading.Lock = field(default_factory=threading.Lock)
 
     def snapshot(self) -> dict:
-        with self._lock:
+        with self.lock:
             return {"checked": self.checked, "found": self.found, "errors": self.errors}
 
-    def inc(self, key: str) -> int:
-        with self._lock:
+    def inc(self, key: str) -> None:
+        with self.lock:
             setattr(self, key, getattr(self, key) + 1)
-            return getattr(self, key)
-
-    def reset(self) -> None:
-        with self._lock:
-            self.checked = self.found = self.errors = 0
-
 
 stats = Stats()
-stop_event = threading.Event()
-throttle_event = threading.Event()
-gen_lock = threading.Lock()
-workers_lock = threading.Lock()
-workers: list[threading.Thread] = []
 
-MAX_THREADS = 15
+# ============ Telegram rate limiter ============
+_tg_send_lock = threading.Lock()
+_last_send_ts = 0.0
+_MIN_SEND_GAP = 1.0 / 25.0
 
+def safe_send(chat_id: int, text: str) -> bool:
+    global _last_send_ts
+    try:
+        with _tg_send_lock:
+            now = time.monotonic()
+            wait = _MIN_SEND_GAP - (now - _last_send_ts)
+            if wait > 0:
+                time.sleep(wait)
+            _last_send_ts = time.monotonic()
+        bot.send_message(chat_id, text)
+        return True
+    except Exception as e:
+        log.warning("safe_send failed: %s", e)
+        return False
 
 def is_owner(m) -> bool:
     return m.from_user is not None and m.from_user.id in OWNER_IDS
 
+_ALPHABET = string.ascii_lowercase + string.digits
 
-# ─────────────────────────────────────────────
-# Username generator
-# ─────────────────────────────────────────────
-_NAME_CHARS = string.ascii_lowercase + string.digits
-_FIRST_CHARS = string.ascii_lowercase
+def gen_psn() -> str:
+    return random.choice(string.ascii_lowercase) + "".join(
+        random.choice(_ALPHABET) for _ in range(4)
+    )
 
-
-def gen_psn():
-    while True:
-        u = random.choice(_FIRST_CHARS) + "".join(
-            random.choice(_NAME_CHARS) for _ in range(4)
-        )
-        yield u
-
-
-# ─────────────────────────────────────────────
-# PSN check
-# ─────────────────────────────────────────────
-CHECK_URL = (
-    "https://secure.us.playstation.com/playstation/psn/profile/"
-    "public/userData?onlineId={u}"
-)
-
-CHECK_HEADERS = {
-    "Accept": "*/*",
-    "X-Requested-With": "XMLHttpRequest",
-    "User-Agent": (
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) "
-        "Version/15.5 Safari/605.1.15"
-    ),
+# ============ Legacy checker ============
+LEGACY_URL = "https://secure.us.playstation.com/playstation/psn/profile/public/userData?onlineId={}"
+LEGACY_HEADERS = {
     "Referer": "https://secure.us.playstation.com/logged-in/trophies/public-trophies/",
+    "User-Agent": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Mobile/15E148 Safari/604.1"
+    ),
 }
 
-
-def check_psn(username: str) -> str | bool:
-    proxy = proxies.pick()
+def check_psn_legacy(username: str) -> Optional[bool]:
     try:
         res = curl_requests.get(
-            CHECK_URL.format(u=username),
-            headers=CHECK_HEADERS,
+            LEGACY_URL.format(username),
+            headers=LEGACY_HEADERS,
             impersonate="safari15_5",
-            timeout=8,
-            proxy=proxy,
+            timeout=10,
         )
-    except curl_requests.errors.RequestsError as e:
-        log.debug("request error (%s): %s", username, e)
-        return "PROXY_FAIL" if proxy else "NET_FAIL"
+        if res.status_code == 200:
+            return res.text.strip() == "{}"
+        if res.status_code in (403, 429):
+            log.warning("Legacy %s => %s", username, res.status_code)
+            return None
     except Exception as e:
-        log.debug("unexpected error (%s): %s", username, e)
-        return "ERROR"
+        log.debug("legacy check %s failed: %s", username, e)
+    return None
 
-    if res.status_code == 200:
-        body = res.text.strip()
-        if body == "{}":
-            return True
-        if body.startswith("{"):
-            return False
-        return "ERROR"
+def classify(username: str) -> str:
+    return "خماسي مكرر" if len(set(username)) < 5 else "خماسي"
 
-    if res.status_code in (403, 429):
-        return "BLOCKED"
+def is_taken_by_psnawp(username: str) -> bool:
+    try:
+        psnawp.user(online_id=username)
+        return True
+    except PSNAWPForbiddenError:
+        return True
+    except PSNAWPNotFoundError:
+        return False
+    except Exception as e:
+        log.debug("psnawp.user(%s) error: %s", username, e)
+        return True
 
-    return "ERROR"
-
-
-# ─────────────────────────────────────────────
-# Safe send with retry
-# ─────────────────────────────────────────────
-def safe_send(chat_id: int, text: str, retries: int = 3) -> bool:
-    for attempt in range(retries):
+# ============ Worker ============
+def worker(chat_id: int) -> None:
+    backoff = 3.0
+    while not stop_psn.is_set() and not shutdown_event.is_set():
+        username = gen_psn()
+        stats.inc("checked")
         try:
-            bot.send_message(chat_id, text)
-            return True
-        except Exception as e:
-            log.warning("send_message فشل (محاولة %d): %s", attempt + 1, e)
-            time.sleep(1 + attempt)
-    return False
-
-
-# ─────────────────────────────────────────────
-# Worker
-# ─────────────────────────────────────────────
-def worker(chat_id: int, psn_gen) -> None:
-    while not stop_event.is_set():
-        try:
-            if throttle_event.is_set():
-                time.sleep(0.3)
-
-            with gen_lock:
-                u = next(psn_gen)
-
-            stats.inc("checked")
-            res = check_psn(u)
-
+            if is_taken_by_psnawp(username):
+                time.sleep(backoff)
+                continue
+            res = check_psn_legacy(username)
+            if res is None:
+                time.sleep(backoff + random.uniform(0, 1.5))
+                backoff = min(backoff * 1.5, 30.0)
+                continue
+            backoff = 3.0
             if res is True:
-                total = stats.inc("found")
-                ts = datetime.datetime.now().strftime("%Y/%m/%d %H:%M:%S")
-                msg = (
-                    f"🎯 يوزر PSN متاح!\n"
-                    f"👤 {html.escape(u)}\n"
-                    f"⏰ {ts}\n"
-                    f"📊 إجمالي: {total}"
-                )
-                safe_send(chat_id, msg)
-
-                throttle_event.set()
-                try:
-                    time.sleep(3)
-                finally:
-                    throttle_event.clear()
-
-            elif res == "BLOCKED":
-                time.sleep(random.uniform(10, 20))
-            elif res in ("PROXY_FAIL", "NET_FAIL"):
-                time.sleep(random.uniform(1, 3))
-            else:
-                time.sleep(random.uniform(0.5, 1.5))
-
+                stats.inc("found")
+                safe_send(chat_id, f"استلم يالامير {username} 🎮🔥\n( سوني - {classify(username)} - متاح )")
+            time.sleep(3 + random.uniform(0, 1.5))
         except Exception as e:
             stats.inc("errors")
-            log.exception("worker crash: %s", e)
-            time.sleep(2)
+            log.exception("worker error: %s", e)
+            time.sleep(2 + random.uniform(0, 1))
 
+def start_psn_snipers(chat_id: int) -> None:
+    if psnawp is None:
+        safe_send(chat_id, f"❌ فشل الاتصال بسوني.\nالسبب: {init_error}")
+        return
+    threading.Thread(target=worker, args=(chat_id,), daemon=True, name=f"worker-{chat_id}").start()
 
-# ─────────────────────────────────────────────
-# Snipers lifecycle
-# ─────────────────────────────────────────────
-def start_psn_snipers(chat_id: int) -> int:
-    with workers_lock:
-        stop_event.set()
-        time.sleep(0.3)
-        alive = [t for t in workers if t.is_alive()]
-        if alive:
-            log.warning("ما زال %d خيطاً حياً بعد stop", len(alive))
-        workers.clear()
-        stop_event.clear()
-        throttle_event.clear()
-
-        psn_gen = gen_psn()
-        for i in range(MAX_THREADS):
-            t = threading.Thread(
-                target=worker,
-                args=(chat_id, psn_gen),
-                name=f"snip-{i}",
-                daemon=True,
-            )
-            t.start()
-            workers.append(t)
-        return len(workers)
-
-
-# ─────────────────────────────────────────────
-# Commands
-# ─────────────────────────────────────────────
+# ============ Handlers ============
 @bot.message_handler(commands=["start"])
 def cmd_start(m):
     if not is_owner(m):
         return
-    bot.reply_to(
-        m,
-        "☢️ PSN Sniper\n"
-        "/psn — تشغيل\n"
-        "/stop_all — إيقاف\n"
-        "/status — إحصائيات\n"
-        "/reload_proxies — إعادة تحميل البروكسي",
-    )
-
+    safe_send(m.chat.id, "☢️ PSN V9 Bot\n\n/psn - تشغيل\n/stop_all - إيقاف\n/status - الإحصائيات")
 
 @bot.message_handler(commands=["psn"])
 def cmd_psn(m):
     if not is_owner(m):
         return
-    if len(proxies) == 0:
-        log.warning("لا بروكسي — سيُفحص بالـ IP المباشر")
-    stats.reset()
-    n = start_psn_snipers(m.chat.id)
-    bot.reply_to(m, f"🚀 تشغيل بـ {n} خيوط...")
-
+    stop_psn.clear()
+    with stats.lock:
+        stats.checked = stats.found = stats.errors = 0
+    safe_send(m.chat.id, "🚀 جاري التشغيل...")
+    start_psn_snipers(m.chat.id)
 
 @bot.message_handler(commands=["stop_all"])
 def cmd_stop_all(m):
     if not is_owner(m):
         return
-    stop_event.set()
-    bot.reply_to(m, "⏹ إيقاف الكل.")
-
+    stop_psn.set()
+    safe_send(m.chat.id, "⏹ تم إيقاف الكل.")
 
 @bot.message_handler(commands=["status"])
 def cmd_status(m):
     if not is_owner(m):
         return
     s = stats.snapshot()
-    msg = (
-        f"📊 الإحصائيات:\n"
-        f"🔍 الفحص: {s['checked']}\n"
-        f"✅ المتاح: {s['found']}\n"
-        f"⚠️ أخطاء: {s['errors']}"
-    )
-    bot.reply_to(m, msg)
+    safe_send(m.chat.id, f"📊 الإحصائيات:\n🔍 الفحص: {s['checked']}\n✅ المتاح: {s['found']}\n⚠️ أخطاء: {s['errors']}")
 
-
-@bot.message_handler(commands=["reload_proxies"])
-def cmd_reload(m):
-    if not is_owner(m):
+# ============ Bot polling thread ============
+def _bot_runner():
+    if _bot_started.is_set():
         return
-    n = proxies.reload()
-    bot.reply_to(m, f"🔄 تم تحميل {n} بروكسي.")
-
-
-# ─────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────
-def main() -> None:
-    threading.Thread(target=run_flask, daemon=True, name="flask").start()
-    log.info("PSN Sniper starting — threads=%d proxies=%d", MAX_THREADS, len(proxies))
-
+    _bot_started.set()
+    log.info("Bot polling starting...")
     try:
         bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
-        log.warning("delete_webhook: %s", e)
-
-    while True:
+        log.warning("delete_webhook failed: %s", e)
+    while not shutdown_event.is_set():
         try:
-            bot.polling(non_stop=True, interval=0, timeout=60)
+            bot.polling(non_stop=True, interval=0, timeout=60, allowed_updates=["message"])
         except Exception as e:
-            log.exception("polling crash: %s", e)
+            log.error("polling crashed: %s", e)
             time.sleep(5)
 
+def _ensure_bot_thread():
+    if not _bot_started.is_set():
+        t = threading.Thread(target=_bot_runner, daemon=True, name="bot-poller")
+        t.start()
 
-if __name__ == "__main__":
-    main()
+@app.before_request
+def _start_bot_once():
+    _ensure_bot_thread()
+
+# ============ Signal handling ============
+def _handle_signal(signum, _frame):
+    log.info("Signal %s — shutdown", signum)
+    stop_psn.set()
+    shutdown_event.set()
+
+signal.signal(signal.SIGTERM, _handle_signal)
+signal.signal(signal.SIGINT, _handle_signal)
