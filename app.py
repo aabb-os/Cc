@@ -5,8 +5,9 @@ import time
 import random
 import string
 import collections
-import json
 from flask import Flask
+from psnawp_api import PSNAWP
+from psnawp_api.core.psnawp_exceptions import PSNAWPNotFoundError, PSNAWPForbiddenError
 from curl_cffi import requests as curl_requests
 
 # --- إعدادات Flask (لـ Render) ---
@@ -14,7 +15,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Sony Real-API Bot is running!"
+    return "Sony God-Mode Bot is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8000))
@@ -32,56 +33,14 @@ if not TOKEN or not OWNER_IDS_STR or not NPSSO_TOKEN:
 OWNER_IDS = [int(i.strip()) for i in OWNER_IDS_STR.split(",")]
 bot = telebot.TeleBot(TOKEN)
 
-# --- متغيرات المصادقة والتوكن ---
-psn_session = curl_requests.Session(impersonate="safari15_5")
-access_token = None
-token_lock = threading.Lock()
-
-# حالة التوكن للمراقبة
-token_info = {
-    "status": "⏳ لم يتم التوليد بعد",
-    "last_time": "غير معروف"
-}
-
-# بيانات الـ Client الرسمية لسوني
-CLIENT_BASIC_AUTH = "Basic MDk1MTUxNTktNzIzNy00MzcwLTliNDAtMzgwNmU2N2MwODkxOnVjUGprYTV0bnRCMktxc1A="
-
-def refresh_token():
-    """توليد توكن وصول جديد من NPSSO"""
-    global access_token, token_info
-    url = "https://ca.account.sony.com/api/authz/v3/oauth/token"
-    headers = {
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Authorization": CLIENT_BASIC_AUTH,
-    }
-    data = {
-        "grant_type": "authorization_code",
-        "code": NPSSO_TOKEN,
-        "redirect_uri": "com.scee.psxandroid.scecompcall://redirect",
-        "token_format": "jwt",
-    }
-    try:
-        res = psn_session.post(url, headers=headers, data=data, timeout=10)
-        if res.status_code == 200:
-            token = res.json().get("access_token")
-            with token_lock:
-                access_token = token
-                token_info["status"] = "✅ تم التوليد بنجاح"
-                token_info["last_time"] = time.strftime("%Y-%m-%d %H:%M:%S")
-            print(f"[{token_info['last_time']}] Access Token generated.")
-            return True
-        else:
-            with token_lock:
-                token_info["status"] = f"❌ فشل (كود: {res.status_code})"
-            print(f"❌ فشل جلب التوكن: {res.status_code} - {res.text}")
-    except Exception as e:
-        with token_lock:
-            token_info["status"] = f"❌ خطأ: {str(e)[:30]}"
-        print(f"❌ خطأ في التوكن: {e}")
-    return False
-
-# تشغيل جلب التوكن في البداية
-refresh_token()
+# --- تهيئة PSNAWP ---
+psnawp = None
+try:
+    psnawp = PSNAWP(NPSSO_TOKEN)
+    psnawp.me()
+    print("✅ PSNAWP initialized successfully.")
+except Exception as e:
+    print(f"❌ PSNAWP initialization error: {e}")
 
 stop_psn = threading.Event()
 stats = {
@@ -103,37 +62,50 @@ def gen_psn():
         yield u
 
 # ==========================================
-# محرك الفحص (الـ API الرسمي القاطع)
+# محرك الفحص (الضربة المزدوجة)
 # ==========================================
-def check_psn_decisive(username):
-    global access_token
-    with token_lock:
-        token = access_token
-    
-    if not token:
+def check_psn_ultimate(username):
+    if not psnawp:
         return "NO_AUTH"
-
-    url = f"https://accounts.api.playstation.com/api/v1/accounts/checkOnlineId?onlineId={username}"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-        "Origin": "https://www.playstation.com",
-        "Referer": "https://www.playstation.com/",
-        "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15"
-    }
-    
+        
+    # 1. الفلتر السريع (PSNAWP)
     try:
-        res = psn_session.get(url, headers=headers, timeout=10)
+        psnawp.user(online_id=username)
+        with stats_lock: stats["codes"]["200 (محجوز)"] += 1
+        return False
+    except PSNAWPForbiddenError:
+        with stats_lock: stats["codes"]["403 (خاص)"] += 1
+        return False 
+    except PSNAWPNotFoundError:
+        with stats_lock: stats["codes"]["404 (مشكوك فيه)"] += 1
+        pass # قد يكون متاح، نكمل للفحص القاطع
+    except Exception as e:
+        with stats_lock: stats["codes"]["Error (شبكة)"] += 1
+        return None
+
+    time.sleep(1.0) # تأخير بسيط
+
+    # 2. الفحص القاطع (الـ API الرسمي لتغيير الاسم)
+    try:
+        # سحب التوكن الحالي من المكتبة
+        token = psnawp.authenticator._access_token
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_1 like Mac OS X) AppleWebKit/605.1.15"
+        }
+        url = f"https://accounts.api.playstation.com/api/v1/accounts/checkOnlineId?onlineId={username}"
+        
+        res = curl_requests.get(url, headers=headers, impersonate="safari15_5", timeout=10)
         
         if res.status_code == 200:
             data = res.json()
             if data.get("available") is True:
                 with stats_lock: stats["codes"]["قاطع (متاح 100%)"] += 1
-                return True
+                return True # متاح 100%
             return False # محجوز
         elif res.status_code in [401, 403]:
-            with stats_lock: stats["codes"]["401/403 (توكن مرفوض)"] += 1
-            refresh_token() # تجديد التوكن
+            with stats_lock: stats["codes"]["401/403 (مرفوض)"] += 1
             return "BLOCKED"
         elif res.status_code == 429:
             with stats_lock: stats["codes"]["429 (حظر)"] += 1
@@ -158,7 +130,7 @@ def human_worker(chat_id):
                 stats["total_checked"] += 1
                 current_checked = stats["total_checked"]
             
-            res = check_psn_decisive(u)
+            res = check_psn_ultimate(u)
             
             if res is True:
                 if len(set(u)) < 5:
@@ -175,7 +147,7 @@ def human_worker(chat_id):
                 bot.send_message(chat_id, msg)
                 
             elif res == "BLOCKED":
-                time.sleep(10) # انتظار عند الحظر
+                time.sleep(15) 
                 continue
                 
             # تحديث الحالة كل 100 فحص
@@ -188,7 +160,7 @@ def human_worker(chat_id):
             time.sleep(2)
 
 def start_psn_snipers(chat_id):
-    if not access_token:
+    if not psnawp:
         bot.send_message(chat_id, "❌ فشل الاتصال بسوني. تأكد من NPSSO_TOKEN.")
         return
         
@@ -202,18 +174,13 @@ def start_psn_snipers(chat_id):
 @bot.message_handler(commands=['start'])
 def cmd_start(m):
     if not is_owner(m): return
-    bot.reply_to(m, "☢️ بوت صيد يوزرات PSN (القاطع الرسمي)\n\n"
-                     "/psn - تشغيل الصيد\n"
-                     "/stop_all - إيقاف\n"
-                     "/status - الإحصائيات\n"
-                     "/sony_status - ردود سوني\n"
-                     "/api_status - حالة الـ API والتوكن")
+    bot.reply_to(m, "☢️ بوت صيد يوزرات PSN (V5 النووي)\n\n/psn - تشغيل الصيد\n/stop_all - إيقاف\n/status - الإحصائيات\n/sony_status - ردود سوني")
 
 @bot.message_handler(commands=['psn'])
 def cmd_psn(m):
     if not is_owner(m): return
     stop_psn.clear()
-    bot.reply_to(m, "🚀 جاري تشغيل الصيد (الـ API الرسمي)...")
+    bot.reply_to(m, "🚀 جاري تشغيل الصيد (الضربة المزدوجة)...")
     start_psn_snipers(m.chat.id)
 
 @bot.message_handler(commands=['stop_all'])
@@ -243,43 +210,12 @@ def cmd_sony_status(m):
                 msg += f"▪️ **{code}**: {count} مرة\n"
     bot.reply_to(m, msg, parse_mode='Markdown')
 
-# 👇 أمر حالة الـ API والتوكن الجديد 👇
-@bot.message_handler(commands=['api_status'])
-def cmd_api_status(m):
-    if not is_owner(m): return
-    
-    with token_lock:
-        status = token_info["status"]
-        last_time = token_info["last_time"]
-        
-    msg = (f"⚙️ **حالة الـ API والتوكن:**\n\n"
-           f"🔑 **التوكن:** {status}\n"
-           f"⏱️ **آخر تحديث:** {last_time}\n\n")
-           
-    # فحص تجريبي سريع قدام المستخدم
-    msg += "🧪 **جاري فحص تجريبي (Live Test)...**\n"
-    test_user = "testuser123xyz"
-    res = check_psn_decisive(test_user)
-    
-    if res is True:
-        msg += f"✅ سوني ردت بنجاح: اليوزر `{test_user}` متاح."
-    elif res is False:
-        msg += f"✅ سوني ردت بنجاح: اليوزر `{test_user}` محجوز."
-    elif res == "BLOCKED":
-        msg += "🚨 سوني رفضت التوكن (401/403) أو حظرت الـ IP (429)."
-    elif res == "NO_AUTH":
-        msg += "❌ ما فيه توكن شغال حالياً."
-    else:
-        msg += "⚠️ خطأ غير معروف في الاتصال."
-
-    bot.reply_to(m, msg, parse_mode='Markdown')
-
 # ==========================================
 # التشغيل النهائي
 # ==========================================
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
-    print("Sony Real-API Bot is running...")
+    print("Sony God-Mode Bot is running...")
     try: bot.delete_webhook(drop_pending_updates=True)
     except: pass
     bot.infinity_polling()
