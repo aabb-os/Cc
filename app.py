@@ -8,14 +8,14 @@ import collections
 from flask import Flask
 from psnawp_api import PSNAWP
 from psnawp_api.core.psnawp_exceptions import PSNAWPNotFoundError, PSNAWPForbiddenError
-from curl_cffi import requests as curl_requests
+from psnawp_api.models.search import SearchDomain
 
 # --- إعدادات Flask (لـ Render) ---
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Sony Decisive Bot is running!"
+    return "Sony Double-Search Bot is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8000))
@@ -62,13 +62,13 @@ def gen_psn():
         yield u
 
 # ==========================================
-# الفحص القاطع (نقطة نهاية تغيير الاسم الرسمية)
+# محرك الفحص (بروفايل + بحث)
 # ==========================================
 def check_psn_decisive(username):
     if not psnawp:
         return "NO_AUTH"
         
-    # 1. الفحص الأولي عبر PSNAWP (لتصفية المحجوزين بسرعة)
+    # 1. فحص البروفايل
     try:
         psnawp.user(online_id=username)
         with stats_lock: stats["codes"]["200 (محجوز)"] += 1
@@ -78,44 +78,27 @@ def check_psn_decisive(username):
         return False 
     except PSNAWPNotFoundError:
         with stats_lock: stats["codes"]["404 (غير موجود)"] += 1
-        pass # ربما متاح، نكمل للفحص القاطع
+        pass # قد يكون متاح، نكمل للبحث
     except Exception as e:
         with stats_lock: stats["codes"]["Error (شبكة)"] += 1
         return None
 
     time.sleep(1.0) # تأخير بسيط
 
-    # 2. الفحص القاطع: نقطة نهاية تغيير الاسم
+    # 2. فحص البحث (للتأكد إذا كان البروفايل مخفي)
     try:
-        token = psnawp.authenticator._access_token
-        headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Origin": "https://www.playstation.com",
-            "Referer": "https://www.playstation.com/"
-        }
-        url = "https://accounts.api.playstation.com/api/v1/accounts/onlineIds"
-        payload = {"onlineId": username, "reserveIfAvailable": True}
+        results = psnawp.search(search_query=username, search_domain=SearchDomain.SOCIAL_ALL_ACCOUNTS)
+        for res in results:
+            if res.get('onlineId') == username:
+                with stats_lock: stats["codes"]["بحث (محجوز)"] += 1
+                return False # محجوز (لقيناه في البحث)
         
-        res = curl_requests.post(url, headers=headers, json=payload, impersonate="safari15_5", timeout=10)
-        
-        if res.status_code == 200:
-            data = res.json()
-            # إذا رجع "available": true فهذا يعني أن الاسم متاح 100%
-            if data.get("available") is True:
-                with stats_lock: stats["codes"]["200 (متاح قاطع)"] += 1
-                return True
-            return False # محجوز
-        elif res.status_code in [401, 403, 429]:
-            with stats_lock: stats["codes"][f"{res.status_code} (حظر)"] += 1
-            return "BLOCKED"
-            
+        # إذا البروفايل غير موجود والبحث ما لقاه = متاح
+        with stats_lock: stats["codes"]["قاطع (متاح)"] += 1
+        return True 
     except Exception as e:
-        with stats_lock: stats["codes"]["Error (قاطع)"] += 1
-        pass
-        
-    return None
+        with stats_lock: stats["codes"]["Error (بحث)"] += 1
+        return None
 
 # ==========================================
 # دالة التشغيل
@@ -146,10 +129,6 @@ def human_worker(chat_id):
                        
                 bot.send_message(chat_id, msg)
                 
-            elif res == "BLOCKED":
-                time.sleep(10) 
-                continue
-                
             # تحديث الحالة كل 100 فحص
             if current_checked % 100 == 0:
                 bot.send_message(chat_id, f"🔄 جاري الفحص... (فحص {current_checked})")
@@ -174,13 +153,13 @@ def start_psn_snipers(chat_id):
 @bot.message_handler(commands=['start'])
 def cmd_start(m):
     if not is_owner(m): return
-    bot.reply_to(m, "☢️ بوت صيد يوزرات PSN (الفحص القاطع)\n\n/psn - تشغيل الصيد\n/stop_all - إيقاف\n/status - الإحصائيات\n/sony_status - ردود سوني")
+    bot.reply_to(m, "☢️ بوت صيد يوزرات PSN (الفحص القاطع المزدوج)\n\n/psn - تشغيل الصيد\n/stop_all - إيقاف\n/status - الإحصائيات\n/sony_status - ردود سوني")
 
 @bot.message_handler(commands=['psn'])
 def cmd_psn(m):
     if not is_owner(m): return
     stop_psn.clear()
-    bot.reply_to(m, "🚀 جاري تشغيل الصيد (الفحص القاطع النهائي)...")
+    bot.reply_to(m, "🚀 جاري تشغيل الصيد (البروفايل + البحث)...")
     start_psn_snipers(m.chat.id)
 
 @bot.message_handler(commands=['stop_all'])
@@ -215,7 +194,7 @@ def cmd_sony_status(m):
 # ==========================================
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
-    print("Sony Decisive Bot is running...")
+    print("Sony Double-Search Bot is running...")
     try: bot.delete_webhook(drop_pending_updates=True)
     except: pass
     bot.infinity_polling()
