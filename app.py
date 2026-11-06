@@ -242,9 +242,8 @@ def _ensure_bot_thread():
         t = threading.Thread(target=_bot_runner, daemon=True, name="bot-poller")
         t.start()
 
-@app.before_request
-def _start_bot_once():
-    _ensure_bot_thread()
+# بدء البوت فوراً عند تشغيل التطبيق
+_ensure_bot_thread()
 
 # ============ Signal handling ============
 def _handle_signal(signum, _frame):
