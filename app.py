@@ -4,16 +4,18 @@ import threading
 import time
 import random
 import string
+import json
 from flask import Flask
 from psnawp_api import PSNAWP
 from psnawp_api.core.psnawp_exceptions import PSNAWPNotFoundError, PSNAWPForbiddenError
+from curl_cffi import requests as curl_requests
 
 # --- إعدادات Flask (لـ Render) ---
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Sony Accurate Bot is running!"
+    return "Sony Double-Check Bot is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8000))
@@ -43,7 +45,7 @@ except Exception as e:
     print(f"❌ PSNAWP initialization error: {init_error}")
 
 stop_psn = threading.Event()
-stats = {"psn_checked": 0, "psn_found": 0, "psn_private": 0}
+stats = {"psn_checked": 0, "psn_found": 0, "psn_private": 0, "psn_error": 0}
 
 def is_owner(m): return m.from_user.id in OWNER_IDS
 
@@ -57,11 +59,13 @@ def gen_psn():
         yield u
 
 # ==========================================
-# محرك الفحص الدقيق 100%
+# محرك الفحص المزدوج (PSNAWP + الموقع الرسمي)
 # ==========================================
 def check_psn_accurate(username):
     if not psnawp:
         return "NO_AUTH"
+
+    # --- الفحص الأول: PSNAWP ---
     try:
         psnawp.user(online_id=username)
         return False # محجوز
@@ -69,11 +73,31 @@ def check_psn_accurate(username):
         stats["psn_private"] += 1
         return False # حساب خاص => محجوز
     except PSNAWPNotFoundError:
-        return True # غير موجود => متاح
+        pass # قد يكون متاحاً، نكمل للفحص الثاني
     except Exception as e:
         if "429" in str(e) or "RateLimit" in str(e):
             return "BLOCKED"
-        return None
+        stats["psn_error"] += 1
+        return "ERROR"
+    
+    time.sleep(1.5) # تأخير بسيط بين الفحصين
+
+    # --- الفحص الثاني: الموقع الرسمي (التحقق من الاستجابة الفارغة) ---
+    try:
+        ts = int(time.time() * 1000)
+        url = f"https://secure.us.playstation.com/playstation/psn/profile/public/userData?onlineId={username}&_={ts}"
+        headers = {"Referer": "https://secure.us.playstation.com/logged-in/trophies/public-trophies/"}
+        res = curl_requests.get(url, headers=headers, impersonate="safari15_5", timeout=10)
+        
+        if res.status_code == 200 and res.text.strip() == "{}":
+            return True # متاح 100% (كلا الفحصين أكدا ذلك)
+        elif res.status_code in [403, 429]:
+            return "BLOCKED"
+        else:
+            return False # الموقع الرسمي أظهر أن هناك بيانات، لذا هو محجوز
+            
+    except Exception:
+        return "ERROR"
 
 # ==========================================
 # خيط واحد فقط + تأخير عشوائي
@@ -95,6 +119,9 @@ def human_worker(chat_id):
             elif res == "NO_AUTH":
                 time.sleep(5)
                 continue
+            elif res == "ERROR":
+                time.sleep(3)
+                continue
                 
             # تأخير عشوائي بين 4 و 7 ثوانٍ
             time.sleep(random.uniform(4.0, 7.0))
@@ -115,13 +142,13 @@ def start_psn_snipers(chat_id):
 def cmd_start(m):
     if not is_owner(m): return
     status = "✅ متصل" if psnawp else "❌ غير متصل"
-    bot.reply_to(m, f"☢️ بوت سوني (دقيق 100%)\nالحالة: {status}\n\n/psn - تشغيل الصيد\n/stop_all - إيقاف\n/status - الإحصائيات")
+    bot.reply_to(m, f"☢️ بوت سوني (تحقق مزدوج)\nالحالة: {status}\n\n/psn - تشغيل الصيد\n/stop_all - إيقاف\n/status - الإحصائيات")
 
 @bot.message_handler(commands=['psn'])
 def cmd_psn(m):
     if not is_owner(m): return
     stop_psn.clear()
-    bot.reply_to(m, "🚀 جاري تشغيل الصيد البشري (خيط واحد + تأخير)...")
+    bot.reply_to(m, "🚀 جاري تشغيل الصيد (تحقق مزدوج + تأخير)...")
     start_psn_snipers(m.chat.id)
 
 @bot.message_handler(commands=['stop_all'])
@@ -134,8 +161,9 @@ def cmd_stop_all(m):
 def cmd_status(m):
     if not is_owner(m): return
     msg = (f"📊 **إحصائيات سوني:**\n\n"
-           f"✅ **المتاح:** {stats['psn_found']}\n"
+           f"✅ **المتاح (مؤكد):** {stats['psn_found']}\n"
            f"🔒 **حسابات خاصة (تم استبعادها):** {stats['psn_private']}\n"
+           f"⚠️ **أخطاء (تم تجاهلها):** {stats['psn_error']}\n"
            f"🔍 **إجمالي الفحص:** {stats['psn_checked']}")
     bot.reply_to(m, msg, parse_mode='Markdown')
 
@@ -144,7 +172,7 @@ def cmd_status(m):
 # ==========================================
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
-    print("Sony Accurate Bot is running...")
+    print("Sony Double-Check Bot is running...")
     try: bot.delete_webhook(drop_pending_updates=True)
     except: pass
     bot.infinity_polling()
