@@ -1,6 +1,4 @@
 # app.py
-# يشتغل كـ: gunicorn app:app
-
 import os
 import signal
 import random
@@ -14,11 +12,6 @@ from typing import Optional
 import telebot
 from flask import Flask
 from psnawp_api import PSNAWP
-from psnawp_api.core.psnawp_exceptions import (
-    PSNAWPNotFoundError,
-    PSNAWPForbiddenError,
-    PSNAWPAuthenticationError,
-)
 from curl_cffi import requests as curl_requests
 
 log = logging.getLogger("psn_bot")
@@ -58,9 +51,6 @@ try:
     psnawp = PSNAWP(NPSSO_TOKEN)
     me = psnawp.me()
     log.info("PSNAWP logged in as %s", me.online_id)
-except PSNAWPAuthenticationError as e:
-    init_error = f"NPSSO منتهي: {e}"
-    log.error(init_error)
 except Exception as e:
     init_error = str(e)
     log.error("PSNAWP init failed: %s", e)
@@ -114,7 +104,7 @@ _ALPHABET = string.ascii_lowercase + string.digits
 
 def gen_psn() -> str:
     return random.choice(string.ascii_lowercase) + "".join(
-        random.choice(_ALPHABET) for _ in range(4)
+        random.choice(_ALPHABET) for _ in range(5)
     )
 
 # ============ Legacy checker ============
@@ -147,15 +137,18 @@ def check_psn_legacy(username: str) -> Optional[bool]:
 def classify(username: str) -> str:
     return "خماسي مكرر" if len(set(username)) < 5 else "خماسي"
 
+# ============ دالة الفحص المحدثة ============
 def is_taken_by_psnawp(username: str) -> bool:
     try:
         psnawp.user(online_id=username)
         return True
-    except PSNAWPForbiddenError:
-        return True
-    except PSNAWPNotFoundError:
-        return False
     except Exception as e:
+        err_name = type(e).__name__
+        # التعرف على الخطأ بناءً على اسمه لتجنب مشاكل الإصدارات
+        if "Forbidden" in err_name or "Unauthorized" in err_name:
+            return True
+        if "NotFound" in err_name:
+            return False
         log.debug("psnawp.user(%s) error: %s", username, e)
         return True
 
