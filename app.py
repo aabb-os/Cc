@@ -8,14 +8,13 @@ import collections
 from flask import Flask
 from psnawp_api import PSNAWP
 from psnawp_api.core.psnawp_exceptions import PSNAWPNotFoundError, PSNAWPForbiddenError
-from psnawp_api.models.search import SearchDomain
 
 # --- إعدادات Flask (لـ Render) ---
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Sony Double-Search Bot is running!"
+    return "Sony Accurate Bot is running!"
 
 def run_flask():
     port = int(os.environ.get("PORT", 8000))
@@ -62,13 +61,13 @@ def gen_psn():
         yield u
 
 # ==========================================
-# محرك الفحص (بروفايل + بحث)
+# محرك الفحص (الفحص المزدوج بدون بحث)
 # ==========================================
-def check_psn_decisive(username):
+def check_psn_accurate(username):
     if not psnawp:
         return "NO_AUTH"
         
-    # 1. فحص البروفايل
+    # الفحص الأول
     try:
         psnawp.user(online_id=username)
         with stats_lock: stats["codes"]["200 (محجوز)"] += 1
@@ -77,27 +76,27 @@ def check_psn_decisive(username):
         with stats_lock: stats["codes"]["403 (خاص/محجوز)"] += 1
         return False 
     except PSNAWPNotFoundError:
-        with stats_lock: stats["codes"]["404 (غير موجود)"] += 1
-        pass # قد يكون متاح، نكمل للبحث
+        with stats_lock: stats["codes"]["404 (متاح)"] += 1
+        pass # قد يكون متاح، نكمل للتأكيد
     except Exception as e:
         with stats_lock: stats["codes"]["Error (شبكة)"] += 1
         return None
 
-    time.sleep(1.0) # تأخير بسيط
+    time.sleep(1.5) # تأخير للتأكيد
 
-    # 2. فحص البحث (للتأكد إذا كان البروفايل مخفي)
+    # الفحص الثاني (التأكيد)
     try:
-        results = psnawp.search(search_query=username, search_domain=SearchDomain.SOCIAL_ALL_ACCOUNTS)
-        for res in results:
-            if res.get('onlineId') == username:
-                with stats_lock: stats["codes"]["بحث (محجوز)"] += 1
-                return False # محجوز (لقيناه في البحث)
-        
-        # إذا البروفايل غير موجود والبحث ما لقاه = متاح
-        with stats_lock: stats["codes"]["قاطع (متاح)"] += 1
-        return True 
+        psnawp.user(online_id=username)
+        with stats_lock: stats["codes"]["200 (محجوز)"] += 1
+        return False
+    except PSNAWPForbiddenError:
+        with stats_lock: stats["codes"]["403 (خاص/محجوز)"] += 1
+        return False
+    except PSNAWPNotFoundError:
+        with stats_lock: stats["codes"]["404 (متاح)"] += 1
+        return True # متاح 100%
     except Exception as e:
-        with stats_lock: stats["codes"]["Error (بحث)"] += 1
+        with stats_lock: stats["codes"]["Error (شبكة)"] += 1
         return None
 
 # ==========================================
@@ -113,7 +112,7 @@ def human_worker(chat_id):
                 stats["total_checked"] += 1
                 current_checked = stats["total_checked"]
             
-            res = check_psn_decisive(u)
+            res = check_psn_accurate(u)
             
             if res is True:
                 if len(set(u)) < 5:
@@ -125,7 +124,7 @@ def human_worker(chat_id):
                     stats["total_found"] += 1
                     
                 msg = (f"استلم يالامير {u} 🎮🔥\n"
-                       f"( سوني - {utype} - قاطع 100% )")
+                       f"( سوني - {utype} )")
                        
                 bot.send_message(chat_id, msg)
                 
@@ -153,13 +152,13 @@ def start_psn_snipers(chat_id):
 @bot.message_handler(commands=['start'])
 def cmd_start(m):
     if not is_owner(m): return
-    bot.reply_to(m, "☢️ بوت صيد يوزرات PSN (الفحص القاطع المزدوج)\n\n/psn - تشغيل الصيد\n/stop_all - إيقاف\n/status - الإحصائيات\n/sony_status - ردود سوني")
+    bot.reply_to(m, "☢️ بوت صيد يوزرات PSN (دقة مزدوجة)\n\n/psn - تشغيل الصيد\n/stop_all - إيقاف\n/status - الإحصائيات\n/sony_status - ردود سوني")
 
 @bot.message_handler(commands=['psn'])
 def cmd_psn(m):
     if not is_owner(m): return
     stop_psn.clear()
-    bot.reply_to(m, "🚀 جاري تشغيل الصيد (البروفايل + البحث)...")
+    bot.reply_to(m, "🚀 جاري تشغيل الصيد...")
     start_psn_snipers(m.chat.id)
 
 @bot.message_handler(commands=['stop_all'])
@@ -173,7 +172,7 @@ def cmd_status(m):
     if not is_owner(m): return
     with stats_lock:
         msg = (f"📊 **إحصائيات سوني:**\n\n"
-               f"✅ **المتاح (قاطع):** {stats['total_found']}\n"
+               f"✅ **المتاح:** {stats['total_found']}\n"
                f"🔍 **إجمالي الفحص:** {stats['total_checked']}")
     bot.reply_to(m, msg, parse_mode='Markdown')
 
@@ -194,7 +193,7 @@ def cmd_sony_status(m):
 # ==========================================
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
-    print("Sony Double-Search Bot is running...")
+    print("Sony Accurate Bot is running...")
     try: bot.delete_webhook(drop_pending_updates=True)
     except: pass
     bot.infinity_polling()
