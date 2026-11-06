@@ -15,10 +15,11 @@ from flask import Flask
 from psnawp_api import PSNAWP
 from curl_cffi import requests as curl_requests
 
+# ============ إعدادات التسجيل (Logs) ============
 log = logging.getLogger("psn_bot")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
-# ============ Config ============
+# ============ الإعدادات ============
 TOKEN = os.environ.get("BOT_TOKEN")
 OWNER_IDS_STR = os.environ.get("OWNER_ID")
 NPSSO_TOKEN = os.environ.get("NPSSO_TOKEN")
@@ -31,7 +32,7 @@ if not TOKEN or not OWNER_IDS_STR or not NPSSO_TOKEN:
 
 OWNER_IDS = {int(x.strip()) for x in OWNER_IDS_STR.split(",") if x.strip().isdigit()}
 
-# ============ Flask app ============
+# ============ Flask App (لـ Render Health Check) ============
 app = Flask(__name__)
 
 @app.route("/")
@@ -43,20 +44,21 @@ def health():
     s = stats.snapshot()
     return {"status": "ok", "stats": s, "psnawp_ready": psnawp is not None}
 
-# ============ Bot & PSNAWP ============
+# ============ إعدادات البوت و PSNAWP ============
 bot = telebot.TeleBot(TOKEN, parse_mode=None)
 
 psnawp: Optional[PSNAWP] = None
 init_error: Optional[str] = None
 try:
+    log.info("🔄 Initializing PSNAWP...")
     psnawp = PSNAWP(NPSSO_TOKEN)
     me = psnawp.me()
-    log.info("PSNAWP logged in as %s", me.online_id)
+    log.info("✅ PSNAWP logged in as %s", me.online_id)
 except Exception as e:
     init_error = str(e)
-    log.error("PSNAWP init failed: %s", e)
+    log.error("❌ PSNAWP init failed: %s", e)
 
-# ============ State ============
+# ============ الحالة والإحصائيات ============
 stop_psn = threading.Event()
 shutdown_event = threading.Event()
 _bot_started = threading.Event()
@@ -78,7 +80,7 @@ class Stats:
 
 stats = Stats()
 
-# ============ Telegram rate limiter ============
+# ============ حماية إرسال الرسائل (Rate Limiter) ============
 _tg_send_lock = threading.Lock()
 _last_send_ts = 0.0
 _MIN_SEND_GAP = 1.0 / 25.0
@@ -108,7 +110,7 @@ def gen_psn() -> str:
         random.choice(_ALPHABET) for _ in range(5)
     )
 
-# ============ Legacy checker ============
+# ============ فحص سوني القديم (Legacy) ============
 LEGACY_URL = "https://secure.us.playstation.com/playstation/psn/profile/public/userData?onlineId={}"
 LEGACY_HEADERS = {
     "Referer": "https://secure.us.playstation.com/logged-in/trophies/public-trophies/",
@@ -138,7 +140,6 @@ def check_psn_legacy(username: str) -> Optional[bool]:
 def classify(username: str) -> str:
     return "خماسي مكرر" if len(set(username)) < 5 else "خماسي"
 
-# ============ دالة الفحص المحدثة ============
 def is_taken_by_psnawp(username: str) -> bool:
     try:
         psnawp.user(online_id=username)
@@ -152,29 +153,48 @@ def is_taken_by_psnawp(username: str) -> bool:
         log.debug("psnawp.user(%s) error: %s", username, e)
         return True
 
-# ============ Worker ============
+# ============ محرك الفحص (Worker) مع نظام تتبع ============
 def worker(chat_id: int) -> None:
     backoff = 3.0
+    log.info(f"🚀 Worker started for chat_id: {chat_id}")
+    
     while not stop_psn.is_set() and not shutdown_event.is_set():
         username = gen_psn()
         stats.inc("checked")
+        log.info(f"🔍 Checking: {username} | Checked: {stats.snapshot()['checked']}")
+        
         try:
+            # 1. الفحص عبر PSNAWP
+            log.info(f"⏳ Requesting PSNAWP for {username}...")
             if is_taken_by_psnawp(username):
+                log.info(f"❌ {username} is taken (PSNAWP).")
                 time.sleep(backoff)
                 continue
+                
+            # 2. الفحص عبر Legacy
+            log.info(f"⏳ Checking Legacy URL for {username}...")
             res = check_psn_legacy(username)
+            
             if res is None:
+                log.warning(f"⚠️ Legacy returned None (Blocked/Timeout) for {username}")
                 time.sleep(backoff + random.uniform(0, 1.5))
                 backoff = min(backoff * 1.5, 30.0)
                 continue
+                
             backoff = 3.0
+            
             if res is True:
+                log.info(f"✅ {username} is AVAILABLE! Sending message...")
                 stats.inc("found")
                 safe_send(chat_id, f"استلم يالامير {username} 🎮🔥\n( سوني - {classify(username)} - متاح )")
+            else:
+                log.info(f"❌ {username} is taken (Legacy).")
+                
             time.sleep(3 + random.uniform(0, 1.5))
+            
         except Exception as e:
             stats.inc("errors")
-            log.exception("worker error: %s", e)
+            log.exception(f"💥 Worker error for {username}: {e}")
             time.sleep(2 + random.uniform(0, 1))
 
 def start_psn_snipers(chat_id: int) -> None:
@@ -183,7 +203,7 @@ def start_psn_snipers(chat_id: int) -> None:
         return
     threading.Thread(target=worker, args=(chat_id,), daemon=True, name=f"worker-{chat_id}").start()
 
-# ============ Handlers ============
+# ============ الأوامر (Handlers) ============
 @bot.message_handler(commands=["start"])
 def cmd_start(m):
     if not is_owner(m):
@@ -194,6 +214,7 @@ def cmd_start(m):
 def cmd_psn(m):
     if not is_owner(m):
         return
+    log.info(f"📥 Received /psn command from chat_id: {m.chat.id}")
     stop_psn.clear()
     with stats.lock:
         stats.checked = stats.found = stats.errors = 0
@@ -214,12 +235,12 @@ def cmd_status(m):
     s = stats.snapshot()
     safe_send(m.chat.id, f"📊 الإحصائيات:\n🔍 الفحص: {s['checked']}\n✅ المتاح: {s['found']}\n⚠️ أخطاء: {s['errors']}")
 
-# ============ Bot polling thread ============
+# ============ تشغيل البوت (Thread) ============
 def _bot_runner():
     if _bot_started.is_set():
         return
     _bot_started.set()
-    log.info("Bot polling starting...")
+    log.info("🤖 Bot polling starting...")
     try:
         bot.delete_webhook(drop_pending_updates=True)
     except Exception as e:
@@ -227,11 +248,11 @@ def _bot_runner():
         
     while not shutdown_event.is_set():
         try:
-            # نستخدم infinity_polling لضمان استمرار العمل وعدم الانهيار
+            # استخدام infinity_polling لمنع انهيار البوت
             bot.infinity_polling(timeout=60, long_polling_timeout=30)
         except Exception as e:
             if "409" in str(e) or "Conflict" in str(e):
-                log.warning("409 Conflict detected (deploy overlap). Waiting 10s to retry...")
+                log.warning("⚠️ 409 Conflict detected (deploy overlap). Waiting 10s to retry...")
                 time.sleep(10)
             else:
                 log.error("polling crashed: %s", e)
@@ -242,10 +263,7 @@ def _ensure_bot_thread():
         t = threading.Thread(target=_bot_runner, daemon=True, name="bot-poller")
         t.start()
 
-# بدء البوت فوراً عند تشغيل التطبيق
-_ensure_bot_thread()
-
-# ============ Signal handling ============
+# ============ معالجة الإشارات (Graceful Shutdown) ============
 def _handle_signal(signum, _frame):
     log.info("Signal %s — shutdown", signum)
     stop_psn.set()
@@ -253,3 +271,10 @@ def _handle_signal(signum, _frame):
 
 signal.signal(signal.SIGTERM, _handle_signal)
 signal.signal(signal.SIGINT, _handle_signal)
+
+# ============ بدء البوت فوراً عند التشغيل ============
+_ensure_bot_thread()
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8000))
+    app.run(host="0.0.0.0", port=port, use_reloader=False, threaded=True)
