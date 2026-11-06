@@ -19,27 +19,36 @@ def run_flask():
     port = int(os.environ.get("PORT", 8000))
     app.run(host='0.0.0.0', port=port)
 
-# --- الإعدادات الأساسية (تقرأ من المتغيرات فقط) ---
+# --- الإعدادات الأساسية ---
 TOKEN = os.environ.get("BOT_TOKEN")
 OWNER_IDS_STR = os.environ.get("OWNER_ID")
 
 if not TOKEN or not OWNER_IDS_STR:
-    print("❌ خطأ: تأكد من إضافة BOT_TOKEN و OWNER_ID في متغيرات البيئة (Environment Variables).")
+    print("❌ خطأ: تأكد من إضافة BOT_TOKEN و OWNER_ID.")
     exit(1)
 
-# تحويل النص إلى قائمة أرقام (عشان لو حطيت أكثر من أيدي بفاصلة)
 OWNER_IDS = [int(i.strip()) for i in OWNER_IDS_STR.split(",")]
-
 bot = telebot.TeleBot(TOKEN)
 
-# جلسة سوني المموهة (تستخدم بصمة سفاري)
+# جلسة سوني المموهة
 psn_session = curl_requests.Session(impersonate="safari15_5")
+
+def warm_up_session():
+    """نسخن الجلسة عشان ناخذ كوكيز من سوني قبل الفحص"""
+    try:
+        print("Warming up Sony session...")
+        psn_session.get("https://www.playstation.com/en-us/", timeout=10)
+        psn_session.get("https://my.account.sony.com/central/unauth/", timeout=10)
+        print("Session warmed up successfully.")
+    except Exception as e:
+        print(f"Warm up error: {e}")
 
 stop_psn = threading.Event()
 
 stats = {
     "psn_checked": 0, "psn_found": 0,
-    "code_200": 0, "code_400": 0, "code_404": 0, "code_429": 0
+    "code_200": 0, "code_400": 0, "code_404": 0, 
+    "code_429": 0, "code_401": 0, "other_errors": 0
 }
 
 def is_owner(m): 
@@ -56,13 +65,12 @@ def gen_psn():
             yield u
 
 # ==========================================
-# محرك فحص سوني (API الرسمي)
+# محرك فحص سوني
 # ==========================================
 def check_psn_api(username):
     ts = int(time.time() * 1000)
     url = f"https://accounts.api.playstation.com/api/v1/accounts/checkOnlineId?onlineId={username}&_={ts}"
     
-    # ترويسات كاملة عشان نخدع سوني إننا متصفح حقيقي
     headers = {
         "Accept": "application/json",
         "Accept-Language": "en-US,en;q=0.9",
@@ -76,19 +84,24 @@ def check_psn_api(username):
     try:
         res = psn_session.get(url, headers=headers, timeout=10)
         
-        # تحديث الإحصائيات بناءً على الرد
+        # تسجيل الإحصائيات
         if res.status_code == 200: stats["code_200"] += 1
         elif res.status_code == 400: stats["code_400"] += 1
         elif res.status_code == 404: stats["code_404"] += 1
         elif res.status_code == 429: stats["code_429"] += 1
+        elif res.status_code == 401: stats["code_401"] += 1
+        else: stats["other_errors"] += 1
         
+        # التحقق من الإجابة
         if res.status_code == 200:
             data = res.json()
             if data.get("available") is True:
-                return True # متاح 100%
-            return False # محجوز
+                return True
+            return False
         elif res.status_code in [429, 403]:
             return "BLOCKED"
+        elif res.status_code == 401:
+            return "UNAUTHORIZED"
             
     except Exception as e:
         print(f"Err: {e}")
@@ -97,7 +110,7 @@ def check_psn_api(username):
     return False
 
 # ==========================================
-# دوال التشغيل (سرعة صاروخية)
+# دوال التشغيل
 # ==========================================
 def worker_psn(chat_id, thread_id):
     while not stop_psn.is_set():
@@ -110,20 +123,26 @@ def worker_psn(chat_id, thread_id):
             if res is True:
                 stats["psn_found"] += 1
                 bot.send_message(chat_id, f"استلم يالامير {u} 🎮🥷🏼\n( سوني - خماسي مكرر )")
+            elif res == "UNAUTHORIZED":
+                # إذا رفضت سوني الجلسة، نسخنها من جديد وننتظر
+                print(f"[Thread {thread_id}] Unauthorized (401). Re-warming session...")
+                warm_up_session()
+                time.sleep(5)
+                continue
             elif res == "BLOCKED":
-                # إذا اكتشفتنا سوني، نوقف الخيط 30 ثانية عشان يبرد الـ IP
                 print(f"[Thread {thread_id}] Rate Limited (429). Sleeping...")
                 time.sleep(30)
                 continue
                 
-            # تأخير بسيط جداً عشان ما نضرب السيرفر بقوة (0.5 إلى 1.5 ثانية)
             time.sleep(random.uniform(0.5, 1.5))
             
         except Exception as e:
             time.sleep(2)
 
 def start_psn_snipers(chat_id):
-    # 10 خيوط عشان السرعة القصوى
+    # نسخن الجلسة أول شي قبل ما نطلق الخيوط
+    warm_up_session()
+    # 10 خيوط عشان السرعة
     for i in range(10): 
         threading.Thread(target=worker_psn, args=(chat_id, i+1), daemon=True).start()
         time.sleep(0.1)
@@ -144,8 +163,8 @@ def cmd_start(m):
 def cmd_psn(m):
     if not is_owner(m): return
     stop_psn.clear()
+    bot.reply_to(m, "🚀 جاري تسخين الجلسة وتشغيل 10 خيوط...")
     start_psn_snipers(m.chat.id)
-    bot.reply_to(m, "🚀 تم تشغيل صيد سوني (10 خيوط) بأقصى سرعة!")
 
 @bot.message_handler(commands=['stop_all'])
 def cmd_stop_all(m):
@@ -160,10 +179,12 @@ def cmd_status(m):
            f"✅ **المتاح:** {stats['psn_found']}\n"
            f"🔍 **إجمالي الفحص:** {stats['psn_checked']}\n\n"
            f"📡 **أكواد الردود:**\n"
-           f"كود 200: {stats['code_200']}\n"
-           f"كود 400: {stats['code_400']}\n"
-           f"كود 404: {stats['code_404']}\n"
-           f"كود 429 (حظر): {stats['code_429']}")
+           f"كود 200 (نجاح): {stats['code_200']}\n"
+           f"كود 404 (غير موجود): {stats['code_404']}\n"
+           f"كود 400 (خطأ بالطلب): {stats['code_400']}\n"
+           f"كود 401 (مرفوض): {stats['code_401']}\n"
+           f"كود 429 (حظر): {stats['code_429']}\n"
+           f"أخطاء أخرى: {stats['other_errors']}")
     bot.reply_to(m, msg, parse_mode='Markdown')
 
 @bot.message_handler(commands=['sony_debug'])
@@ -171,6 +192,9 @@ def cmd_sony_debug(m):
     if not is_owner(m): return
     test_user = next(gen_psn())
     bot.reply_to(m, f"جاري الفحص التشخيصي على يوزر: `{test_user}`...")
+    
+    # نسخن الجلسة قبل الفحص التشخيصي
+    warm_up_session()
     
     ts = int(time.time() * 1000)
     url = f"https://accounts.api.playstation.com/api/v1/accounts/checkOnlineId?onlineId={test_user}&_={ts}"
